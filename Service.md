@@ -1,9 +1,13 @@
+# Service Creation
+
 1. **Create a Service File**:
+
    ```sh
    sudo nano /etc/systemd/system/myscript.service
    ```
 
 2. **Add the Following Content**:
+
 ```ini
 [Unit]
 Description=My Script Service
@@ -21,11 +25,16 @@ User=pi
 WantedBy=multi-user.target
 ```
 
-   Replace `/path/to/your/main.py` and `/path/to/your/script` with the actual paths to your script.
+Replace `/path/to/your/main.py` and `/path/to/your/script` with the actual paths to your script.
 
 3. **Reload Systemd and Enable the Service**:
    ```sh
    sudo systemctl daemon-reload
    sudo systemctl enable myscript.service
    sudo systemctl start myscript.service
+   ```
+
+4. **Check the status of the service**
+   ```sh
+   systemctl status myscript.service
    ```
