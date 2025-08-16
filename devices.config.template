@@ -1,0 +1,11 @@
+# Govee Device Configuration Template
+# Copy this file to 'devices.config' and fill in your actual device information
+# The devices.config file should never be committed to git
+
+[humidity_sensor]
+sku = H5179
+device = YOUR_HUMIDITY_SENSOR_MAC_ADDRESS
+
+[control_device]
+sku = H5080
+device = YOUR_CONTROL_DEVICE_MAC_ADDRESS

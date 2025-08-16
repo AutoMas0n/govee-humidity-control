@@ -1,9 +1,50 @@
-# Python
+# Govee Humidity Control
+
+This project monitors humidity using a Govee sensor and controls a Govee device based on humidity levels.
+
+## Setup Instructions
+
+### 1. Python Environment
+```sh
 python3 -m venv venv
 source venv/bin/activate
 pip install --upgrade pip
-touch main.py
-pip freeze > requirements.txt
+pip install -r requirements.txt
+```
+
+### 2. Configuration Setup
+
+**Important**: This project uses configuration files to keep sensitive device information secure and out of version control.
+
+1. **API Key Setup**:
+   - Create an `api_key.secret` file in the project root
+   - Add your Govee API key to this file
+   - This file is already gitignored for security
+
+2. **Device Configuration**:
+   - Copy the template: `cp devices.config.template devices.config`
+   - Edit `devices.config` and replace the placeholder MAC addresses with your actual device information:
+     ```
+     [humidity_sensor]
+     sku = H5179
+     device = YOUR_ACTUAL_HUMIDITY_SENSOR_MAC
+
+     [control_device] 
+     sku = H5080
+     device = YOUR_ACTUAL_CONTROL_DEVICE_MAC
+     ```
+   - The `devices.config` file is gitignored and will not be committed to the repository
+
+### 3. Running the Application
+```sh
+python main.py
+```
+
+The application will:
+- Monitor humidity every 15 minutes
+- Turn ON the control device when humidity > 45%
+- Turn OFF the control device when humidity ≤ 45%
+- Log all activities to `request_logs.log`
 
 # Rust
 
