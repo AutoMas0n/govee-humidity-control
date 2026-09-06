@@ -1,4 +1,3 @@
-import configparser
 import logging
 import os
 import signal
@@ -25,40 +24,13 @@ def load_api_key(file_path):
     return api_key
 
 
-def load_device_config(config_path):
-    """Load device configuration from config file"""
-    if not os.path.exists(config_path):
-        logging.error(f"Device config file not found: {config_path}")
-        logging.error("Please copy devices.config.template to devices.config and fill in your device information")
-        sys.exit(1)
-    
-    config = configparser.ConfigParser()
-    config.read(config_path)
-    
-    device_config = {
-        'humidity_sensor': {
-            'sku': config.get('humidity_sensor', 'sku'),
-            'device': config.get('humidity_sensor', 'device')
-        },
-        'control_device': {
-            'sku': config.get('control_device', 'sku'),
-            'device': config.get('control_device', 'device')
-        }
-    }
-    
-    return device_config
-
-
-def check_humidity(api_key, device_config):
+def check_humidity(api_key):
     try:
         url = "https://openapi.api.govee.com/router/api/v1/device/state"
         headers = {"Content-Type": "application/json", "Govee-API-Key": api_key}
         payload = {
             "requestId": "uuid",
-            "payload": {
-                "sku": device_config['humidity_sensor']['sku'], 
-                "device": device_config['humidity_sensor']['device']
-            },
+            "payload": {"sku": "H5179", "device": "FA:8C:E3:32:81:12:40:A4"},
         }
         request_id = str(uuid.uuid4())
         payload["requestId"] = request_id
@@ -82,15 +54,15 @@ def check_humidity(api_key, device_config):
         return None
 
 
-def control_device(api_key, value, device_config):
+def control_device(api_key, value):
     try:
         url = "https://openapi.api.govee.com/router/api/v1/device/control"
         headers = {"Content-Type": "application/json", "Govee-API-Key": api_key}
         payload = {
             "requestId": "uuid",
             "payload": {
-                "sku": device_config['control_device']['sku'],
-                "device": device_config['control_device']['device'],
+                "sku": "H5080",
+                "device": "B4:8F:D4:AD:FC:41:E1:DC",
                 "capability": {
                     "type": "devices.capabilities.on_off",
                     "instance": "powerSwitch",
@@ -121,26 +93,12 @@ signal.signal(signal.SIGINT, signal_handler)
 file_path = os.path.join(os.path.dirname(__file__), "api_key.secret")
 api_key = load_api_key(file_path)
 
-# Load device configuration
-config_path = os.path.join(os.path.dirname(__file__), "devices.config")
-device_config = load_device_config(config_path)
-
-logging.info("Starting humidity control service...")
-logging.info(f"Monitoring humidity sensor: {device_config['humidity_sensor']['sku']}")
-logging.info(f"Controlling device: {device_config['control_device']['sku']}")
-
 while True:
-    humidity = check_humidity(api_key, device_config)
+    humidity = check_humidity(api_key)
     if humidity is not None:
-        logging.info(f"Current humidity: {humidity}%")
         if humidity > 45:
-            result = control_device(api_key, 1, device_config)  # Turn on device
-            if result == 200:
-                logging.info("Device turned ON (humidity > 45%)")
+            control_device(api_key, 1)  # Turn on H5080 device
         else:
-            result = control_device(api_key, 0, device_config)  # Turn off device
-            if result == 200:
-                logging.info("Device turned OFF (humidity <= 45%)")
-    else:
-        logging.warning("Failed to read humidity data")
+            control_device(api_key, 0)  # Turn off H5080 device
     time.sleep(check_interval)
+

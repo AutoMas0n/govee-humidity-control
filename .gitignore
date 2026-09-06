@@ -11,15 +11,15 @@ venv/
 
 # Secrets
 *.secret
-devices.config
 
-## Rust
+# Logs
+*.log
+nohup.out
+request_logs.log
 
-# Binaries
+# Rust artifacts
 /target
 **/*.rs.bk
-
-# Build artifacts
 /target/
 **/*.rlib
 **/*.rmeta
@@ -28,5 +28,5 @@ devices.config
 Cargo.lock
 *.crate
 
-
-*.log
+# Misc
+openssl-*.tar.gz
