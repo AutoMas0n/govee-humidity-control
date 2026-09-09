@@ -18,15 +18,13 @@ nohup.out
 request_logs.log
 
 # Rust artifacts
-/target
+**/target/
 **/*.rs.bk
-/target/
 **/*.rlib
 **/*.rmeta
 
 # Packages
-Cargo.lock
-*.crate
+
 
 # Misc
 openssl-*.tar.gz
