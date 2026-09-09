@@ -41,37 +41,25 @@ RC4 is trivially implementable (~15 lines). `aes` crate is pure Rust, works on a
 - `openssl` crate: ARM build would need `libssl-dev`, adds a C dependency to an otherwise pure-Rust crate
 - Single 20-byte unkeyed CRC: the protocol uses RC4 on the last 4 bytes specifically — not replacable
 
-### Decision: CLI subcommands via clap derive
+### Decision: No clap — manual argv
 
-The ROADMAP specifies `govee-ble read`, `govee-ble on`, `govee-ble off`, `govee-ble status`, `govee-ble daemon`. clap derive maps directly to this with `#[derive(Parser)]` enum dispatch.
+clap adds ~30s to armv7l compilation and pulls in a dependency tree. Manual `args.iter().position()` is 3 lines, zero compile cost, and just as readable for 5 subcommands.
 
-### Decision: Single crate, not workspace
+### Decision: Single file, not multi-module
 
-The library (`lib.rs`) and CLI (`main.rs`) live in one crate. The daemon is a subcommand within `main.rs`. No need for a workspace until/unless an octx arm is added.
+The entire crate is `src/main.rs`. Crypto (3 functions), protocol (2 functions), BLE scan, BLE control, daemon loop. Splitting into 6 files adds `mod` declarations, pub visibility decisions, and cross-module import boilerplate with zero runtime benefit. All functions are private or local to the single file.
 
-## Architecture
+### Decision: No thiserror/anyhow
 
-```
-govee-ble/
-├── Cargo.toml
-└── src/
-    ├── main.rs              # CLI entry: enum dispatch to subcommands
-    ├── lib.rs               # Re-export public API
-    ├── crypto.rs            # AES-ECB + RC4 encrypt/decrypt
-    ├── protocol.rs          # Frame construction, checksum, session key
-    ├── h5080.rs             # H5080 connect + handshake + init + toggle
-    ├── h5179.rs             # H5179 advertisement scanner + parse
-    └── daemon.rs            # Continuous humidity loop
-```
+`String` error type with `map_err(|e| format!("{e}"))` is 10 chars. thiserror adds derive macros and another compile cost. For a binary with ~10 fallible operations, String errors are the lazy choice — they print what happened without any type-level tax.
 
-### Module responsibilities
+### Decision: Plain TCP GET for healthcheck, not reqwest
 
-- `crypto.rs`: pure functions `encrypt(frame, key) -> [u8; 20]` and `decrypt(payload, key) -> [u8; 20]`, constants `KEY_COMM`
-- `protocol.rs`: `frame_from(cmd, sub, &data) -> [u8; 20]`, `verify(frame) -> bool`
-- `h5080.rs`: `H5080` struct with `connect`, `handshake`, `init`, `turn_on`, `turn_off`, `get_state`, `disconnect`. Uses notify callback to capture device responses.
-- `h5179.rs`: `H5179Reading::from_manufacturer_data(&[u8]) -> Option<Self>`. Scanner via btleplug `scan_for_device_by_address`.
-- `daemon.rs`: `run(interval, threshold)` — infinite loop with tokio::time::sleep, state tracking, error logging
-- `main.rs`: clap `enum Subcommand { Read, On, Off, Status, Daemon { interval, threshold } }`
+`reqwest` pulls in hyper, h2, rustls — megabytes of compile on armv7l. Healthcheck services (healthchecks.io, uptimerobot) support plain HTTP. A raw TCP GET via `tokio::net::TcpStream` is 8 lines and needs TLS only if the user specifies https://. If they need HTTPS, they can run a local relay.
+
+### Decision: 3 retries with exponential backoff, inline
+
+A trait-based retry framework (backoff, governor, or custom) adds abstractions for a single call site. Three inline attempts with `2u64.pow(attempt)` sleep is 6 lines. Add when there are >1 callers with different retry policies
 
 ### Flow (daemon mode)
 
@@ -100,25 +88,32 @@ Key difference from Python: Rust keeps the `last_state` in a struct field (not a
 
 - **[Risk] btleplug API stability**: btleplug has churned across versions. Lock to a specific version in Cargo.toml and test upgrades explicitly.
 - **[Risk] First build time**: Compiling btleplug + its deps on an armv7l Pi takes 20-30 minutes. Use `--release` only after verifying debug builds work.
-- **[Risk] Notification timing**: btleplug's notification callback is async; the Python controller uses `asyncio.sleep` to wait for device responses. Rust must handle the same race: send command, wait for notification with a timeout, return error if no response.
+- **[Risk] Notification timing**: btleplug's notification callback is sync (blocking_lock). If the device sends notifications faster than the main loop drains them, the buffer grows. Mitigation: drain after every write, and the plug sends at most 1 notification per command.
+- **[Risk] blocking_lock in notification callback**: The `n.blocking_lock()` inside the btleplug notification closure can stall if the main task holds the lock long. Mitigation: the main task holds the lock only briefly (drain to local vec, release immediately). Swap to a `tokio::sync::mpsc` channel if throughput ever becomes an issue.
 - **[Trade-off] No hot-reload**: Unlike Python, you can't edit the running Rust code and see changes instantly. Each fix requires recompile + systemd restart.
 - **[Risk] RC4 is deterministic**: RC4's keystream is the same for a given key every time. This matches the protocol's design (validated against captures). No security concern here — the key is static and known.
 - **[Trade-off] PI startup time**: Python cold start ~0.3s; Rust cold start ~1ms. The daemon runs continuously so this only matters on system boot.
 
 ## Migration Plan
 
-1. Copy `h5080_controller.py` and `scripts/govee_ble_protocol.py` reference files to the Pi (`~/govee/`)
-2. Create the Rust crate on the Pi: `cargo new govee-ble && cd govee-ble`
-3. Add dependencies to Cargo.toml and implement `crypto.rs` + `protocol.rs` first (no BLE dependency, testable standalone)
-4. Implement `h5179.rs` — test with `cargo run -- read`
-5. Implement `h5080.rs` — test with `cargo run -- on` / `cargo run -- off`
-6. Implement `daemon.rs` — test with `cargo run -- daemon --interval 60` (short interval for testing)
-7. Build release: `cargo build --release`
-8. Deploy: `sudo cp target/release/govee-ble /usr/local/bin/`
-9. Update systemd: `ExecStart=/usr/local/bin/govee-ble daemon`
-10. Rollback: `ExecStart=/usr/bin/python3 /home/pi/Github/govee-humidity-control/main.py`
+1. Pull the crate from GitHub on the Pi: `cd ~/Github/govee-humidity-control && git pull`
+2. Install a current Rust toolchain on the Pi: `curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y` (Debian's rustc 1.63 is too old for btleplug's dependencies)
+3. Build debug: `cd govee-ble && cargo build`
+4. Test CLI: `./target/debug/govee-ble read`, `./target/debug/govee-ble on`, `./target/debug/govee-ble off`, `./target/debug/govee-ble status`
+5. Build release: `cargo build --release`
+6. Deploy: `sudo cp target/release/govee-ble /usr/local/bin/`
+7. Test daemon: `govee-ble daemon --interval 60 --threshold 45 --hc-url http://your-id.healthchecks.io`
+8. Update systemd: `ExecStart=/usr/local/bin/govee-ble daemon`
+
+Rollback:
+```bash
+sudo sed -i 's|/usr/local/bin/govee-ble daemon|/usr/bin/python3 /home/pi/Github/govee-humidity-control/main.py|' /etc/systemd/system/myscript.service
+sudo systemctl daemon-reload && sudo systemctl restart myscript.service
+```
 
 ## Open Questions
 
-- Should the daemon support multiple H5080 plugs (for users with >1 plug)? Could be added later as a `--mac` flag without changing the architecture.
-- Naming convention: `govee-ble` vs `govee_ble` — clap subcommands prefer kebab-case binary names.
+None — all deferred decisions are marked with `ponytail:` comments in the source code.
+- Session key nonce: using `[0u8; 16]` instead of random bytes for E7 handshake. Add urandom if device ever rejects. Not needed — frame is encrypted anyway.
+- HTTPS for healthcheck: raw TCP only. Add TLS if using healthchecks.io with https.
+- Multiple plugs: `--mac` flag can be added later without architecture change.
