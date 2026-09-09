@@ -4,6 +4,7 @@ use btleplug::api::{
     bleuuid::BleUuid, Central, CharPropFlags, Manager as _, Peripheral, ScanFilter, WriteType,
 };
 use futures::StreamExt;
+use std::future::Future;
 use std::time::Duration;
 use tokio::time::sleep;
 
@@ -157,18 +158,18 @@ async fn init_plug(per: &btleplug::platform::Peripheral, sk: &[u8; 16]) -> Resul
 }
 
 // ========================= PLUG CONNECTION (connect + handshake + init + action) =========================
-async fn try_plug_inner<T, Fut>(action: impl FnOnce(&btleplug::platform::Peripheral, &[u8; 16]) -> Fut) -> Result<T, String>
+async fn try_plug_inner<T, Fut>(action: impl FnOnce(btleplug::platform::Peripheral, [u8; 16]) -> Fut) -> Result<T, String>
 where Fut: Future<Output = Result<T, String>>,
 {
     let c = adapter().await;
     let per = find_mac(&c, PLUG_MAC, 10).await?;
     per.connect().await.map_err(|e| format!("conn: {e}"))?;
     sleep(Duration::from_millis(500)).await;
+    per.discover_services().await.map_err(|e| format!("disc svc: {e}"))?;
     sub_notify(&per).await?;
     let sk = handshake(&per).await?;
     init_plug(&per, &sk).await?;
-    let r = action(&per, &sk).await;
-    per.disconnect().await.ok();
+    let r = action(per, sk).await;
     drop(c);
     r
 }
@@ -177,7 +178,12 @@ where Fut: Future<Output = Result<T, String>>,
 async fn plug_on() -> Result<(), String> {
     let mut err = String::new();
     for a in 0..3 {
-        match try_plug_inner(|p, sk| Box::pin(async move { plug_write(p, sk, true).await })).await {
+        match try_plug_inner(|per, sk| Box::pin(async move {
+            let r = write_ctrl(&per, &encrypt(&frame_from(0x33, 0x01, &[0x11]), &sk)).await;
+            per.disconnect().await.ok();
+            sleep(Duration::from_millis(500)).await;
+            r
+        })).await {
             Ok(r) => return Ok(r),
             Err(e) => { err = e; log::warn!("on retry {}/3: {err}", a+1); sleep(Duration::from_secs(2u64.pow(a))).await; }
         }
@@ -188,7 +194,12 @@ async fn plug_on() -> Result<(), String> {
 async fn plug_off() -> Result<(), String> {
     let mut err = String::new();
     for a in 0..3 {
-        match try_plug_inner(|p, sk| Box::pin(async move { plug_write(p, sk, false).await })).await {
+        match try_plug_inner(|per, sk| Box::pin(async move {
+            let r = write_ctrl(&per, &encrypt(&frame_from(0x33, 0x01, &[0x10]), &sk)).await;
+            per.disconnect().await.ok();
+            sleep(Duration::from_millis(500)).await;
+            r
+        })).await {
             Ok(r) => return Ok(r),
             Err(e) => { err = e; log::warn!("off retry {}/3: {err}", a+1); sleep(Duration::from_secs(2u64.pow(a))).await; }
         }
@@ -196,19 +207,12 @@ async fn plug_off() -> Result<(), String> {
     Err(format!("plug_off failed: {err}"))
 }
 
-async fn plug_write(per: &btleplug::platform::Peripheral, sk: &[u8; 16], on: bool) -> Result<(), String> {
-    let data = if on { &[0x11] } else { &[0x10] };
-    write_ctrl(per, &encrypt(&frame_from(0x33, 0x01, data), sk)).await?;
-    sleep(Duration::from_millis(500)).await;
-    Ok(())
-}
-
 async fn plug_status() -> Result<bool, String> {
     let mut err = String::new();
     for a in 0..3 {
-        match try_plug_inner(|p, sk| Box::pin(async move {
-            write_ctrl(p, &encrypt(&frame_from(0xAA, 0x01, &[]), sk)).await?;
-            let mut s = p.notifications().await.map_err(|e| format!("notif: {e}"))?;
+        match try_plug_inner(|per, sk| Box::pin(async move {
+            write_ctrl(&per, &encrypt(&frame_from(0xAA, 0x01, &[]), &sk)).await?;
+            let mut s = per.notifications().await.map_err(|e| format!("notif: {e}"))?;
             let d = tokio::time::Instant::now() + Duration::from_secs(2);
             while tokio::time::Instant::now() < d {
                 let n = tokio::time::timeout(Duration::from_millis(200), s.next()).await.ok().and_then(|x| x);
@@ -216,12 +220,14 @@ async fn plug_status() -> Result<bool, String> {
                     let mut buf = [0u8; 20];
                     let l = v.value.len().min(20);
                     buf[..l].copy_from_slice(&v.value[..l]);
-                    let dec = decrypt(&buf, sk);
+                    let dec = decrypt(&buf, &sk);
                     if dec[0] == 0xAA && dec[1] == 0x01 && verify(&dec) {
+                        per.disconnect().await.ok();
                         return Ok(dec[2] == 1);
                     }
                 }
             }
+            per.disconnect().await.ok();
             Err("no state response".into())
         })).await {
             Ok(r) => return Ok(r),
