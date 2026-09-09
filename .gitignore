@@ -30,3 +30,9 @@ Cargo.lock
 
 # Misc
 openssl-*.tar.gz
+
+# Personal agent config
+.pi/
+
+# Temp capture data
+captured_payloads.txt
