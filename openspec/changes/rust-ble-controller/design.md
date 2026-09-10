@@ -116,4 +116,4 @@ sudo systemctl daemon-reload && sudo systemctl restart myscript.service
 None — all deferred decisions are marked with `ponytail:` comments in the source code.
 - Session key nonce: using `[0u8; 16]` instead of random bytes for E7 handshake. Add urandom if device ever rejects. Not needed — frame is encrypted anyway.
 - HTTPS for healthcheck: raw TCP only. Add TLS if using healthchecks.io with https.
-- Multiple plugs: `--mac` flag can be added later without architecture change.
+- Multiple plugs: `--mac addr` flag on `on`/`off`/`status`, `--plug-mac`/`--sensor-mac` on `daemon`. Defaults use the hardcoded consts.

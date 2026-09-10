@@ -158,11 +158,11 @@ async fn init_plug(per: &btleplug::platform::Peripheral, sk: &[u8; 16]) -> Resul
 }
 
 // ========================= PLUG CONNECTION (connect + handshake + init + action) =========================
-async fn try_plug_inner<T, Fut>(action: impl FnOnce(btleplug::platform::Peripheral, [u8; 16]) -> Fut) -> Result<T, String>
+async fn try_plug_inner<T, Fut>(plug_mac: &str, action: impl FnOnce(btleplug::platform::Peripheral, [u8; 16]) -> Fut) -> Result<T, String>
 where Fut: Future<Output = Result<T, String>>,
 {
     let c = adapter().await;
-    let per = find_mac(&c, PLUG_MAC, 10).await?;
+    let per = find_mac(&c, plug_mac, 10).await?;
     per.connect().await.map_err(|e| format!("conn: {e}"))?;
     sleep(Duration::from_millis(500)).await;
     per.discover_services().await.map_err(|e| format!("disc svc: {e}"))?;
@@ -175,10 +175,10 @@ where Fut: Future<Output = Result<T, String>>,
 }
 
 // ========================= PLUG COMMANDS (each with own retry) =========================
-async fn plug_on() -> Result<(), String> {
+async fn plug_on(plug_mac: &str) -> Result<(), String> {
     let mut err = String::new();
     for a in 0..3 {
-        match try_plug_inner(|per, sk| Box::pin(async move {
+        match try_plug_inner(plug_mac, |per, sk| Box::pin(async move {
             let r = write_ctrl(&per, &encrypt(&frame_from(0x33, 0x01, &[0x11]), &sk)).await;
             per.disconnect().await.ok();
             sleep(Duration::from_millis(500)).await;
@@ -191,10 +191,10 @@ async fn plug_on() -> Result<(), String> {
     Err(format!("plug_on failed: {err}"))
 }
 
-async fn plug_off() -> Result<(), String> {
+async fn plug_off(plug_mac: &str) -> Result<(), String> {
     let mut err = String::new();
     for a in 0..3 {
-        match try_plug_inner(|per, sk| Box::pin(async move {
+        match try_plug_inner(plug_mac, |per, sk| Box::pin(async move {
             let r = write_ctrl(&per, &encrypt(&frame_from(0x33, 0x01, &[0x10]), &sk)).await;
             per.disconnect().await.ok();
             sleep(Duration::from_millis(500)).await;
@@ -207,10 +207,10 @@ async fn plug_off() -> Result<(), String> {
     Err(format!("plug_off failed: {err}"))
 }
 
-async fn plug_status() -> Result<bool, String> {
+async fn plug_status(plug_mac: &str) -> Result<bool, String> {
     let mut err = String::new();
     for a in 0..3 {
-        match try_plug_inner(|per, sk| Box::pin(async move {
+        match try_plug_inner(plug_mac, |per, sk| Box::pin(async move {
             write_ctrl(&per, &encrypt(&frame_from(0xAA, 0x01, &[]), &sk)).await?;
             let mut s = per.notifications().await.map_err(|e| format!("notif: {e}"))?;
             let d = tokio::time::Instant::now() + Duration::from_secs(2);
@@ -286,18 +286,19 @@ async fn ping_hc(url: &str, fail: bool) {
 }
 
 // ========================= DAEMON =========================
-async fn daemon_loop(interval_s: u64, threshold: u8, hc_url: String) {
+async fn daemon_loop(interval_s: u64, threshold: u8, hc_url: String,
+                     plug_mac: &str, sensor_mac: &str) {
     log::info!("daemon: interval={interval_s}s threshold={threshold}%");
     let mut last_on: Option<bool> = None;
     loop {
-        match read_sensor(SENSOR_MAC, 10).await {
+        match read_sensor(sensor_mac, 10).await {
             Ok((t, h, b)) => {
                 log::info!("sensor: {t:.1}C {h}% batt={b}%");
                 let need_on = h > threshold;
                 if last_on.map(|o| o != need_on).unwrap_or(true) {
                     log::info!("need {}", if need_on { "ON" } else { "OFF" });
-                    if need_on { let _ = plug_on().await; }
-                    else { let _ = plug_off().await; }
+                    if need_on { let _ = plug_on(plug_mac).await; }
+                    else { let _ = plug_off(plug_mac).await; }
                     last_on = Some(need_on);
                 }
                 ping_hc(&hc_url, false).await;
@@ -313,28 +314,38 @@ fn get_arg(args: &[String], name: &str) -> Option<String> {
     args.iter().position(|a| a == name).and_then(|i| args.get(i+1)).cloned()
 }
 
+fn get_mac(args: &[String], name: &str, default: &str) -> String {
+    get_arg(args, name).unwrap_or_else(|| default.to_string())
+}
+
 #[tokio::main]
 async fn main() {
     let args: Vec<String> = std::env::args().collect();
     if args.len() < 2 {
         eprintln!("Usage: govee-ble <read|on|off|status|daemon>");
+        eprintln!("  read:   [--mac <addr>]");
+        eprintln!("  on/off: [--mac <addr>]");
+        eprintln!("  status: [--mac <addr>]");
         eprintln!("  daemon: [--interval SEC] [--threshold PCT] [--hc-url URL]");
+        eprintln!("          [--plug-mac <addr>] [--sensor-mac <addr>]");
+        eprintln!("  Default plug MAC: {PLUG_MAC}");
+        eprintln!("  Default sensor MAC: {SENSOR_MAC}");
         return;
     }
     match args[1].as_str() {
-        "read" => match read_sensor(SENSOR_MAC, 10).await {
+        "read" => match read_sensor(&get_mac(&args, "--mac", SENSOR_MAC), 10).await {
             Ok((t,h,b)) => println!("{t:.1}C {h}% {b}%"),
             Err(e) => { eprintln!("{e}"); std::process::exit(1); }
         },
-        "on" => match plug_on().await {
+        "on" => match plug_on(&get_mac(&args, "--mac", PLUG_MAC)).await {
             Ok(_) => println!("ON"),
             Err(e) => { eprintln!("{e}"); std::process::exit(1); }
         },
-        "off" => match plug_off().await {
+        "off" => match plug_off(&get_mac(&args, "--mac", PLUG_MAC)).await {
             Ok(_) => println!("OFF"),
             Err(e) => { eprintln!("{e}"); std::process::exit(1); }
         },
-        "status" => match plug_status().await {
+        "status" => match plug_status(&get_mac(&args, "--mac", PLUG_MAC)).await {
             Ok(s) => println!("{}", if s { "ON" } else { "OFF" }),
             Err(e) => { eprintln!("{e}"); std::process::exit(1); }
         },
@@ -344,6 +355,8 @@ async fn main() {
                 get_arg(&args, "--interval").and_then(|v| v.parse().ok()).unwrap_or(900),
                 get_arg(&args, "--threshold").and_then(|v| v.parse().ok()).unwrap_or(45),
                 get_arg(&args, "--hc-url").unwrap_or_default(),
+                &get_mac(&args, "--plug-mac", PLUG_MAC),
+                &get_mac(&args, "--sensor-mac", SENSOR_MAC),
             ).await;
         }
         _ => { eprintln!("unknown: {}", args[1]); std::process::exit(1); }
