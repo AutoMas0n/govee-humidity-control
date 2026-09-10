@@ -1,7 +1,7 @@
 use aes::cipher::{generic_array::GenericArray, BlockDecrypt, BlockEncrypt, KeyInit};
 use aes::Aes128;
 use btleplug::api::{
-    bleuuid::BleUuid, Central, CharPropFlags, Manager as _, Peripheral, ScanFilter, WriteType,
+    Central, CharPropFlags, Manager as _, Peripheral, ScanFilter, WriteType,
 };
 use futures::StreamExt;
 use std::future::Future;
@@ -322,10 +322,10 @@ fn get_mac(args: &[String], name: &str, default: &str) -> String {
 async fn main() {
     let args: Vec<String> = std::env::args().collect();
     if args.len() < 2 {
-        eprintln!("Usage: govee-ble <read|on|off|status|daemon>");
+        eprintln!("Usage: govee-ble <read|on|off|status|scan|daemon>");
         eprintln!("  read:   [--mac <addr>]");
-        eprintln!("  on/off: [--mac <addr>]");
-        eprintln!("  status: [--mac <addr>]");
+        eprintln!("  on/off/status: [--mac <addr>]");
+        eprintln!("  scan:   (no args, lists all nearby BLE devices 8s)");
         eprintln!("  daemon: [--interval SEC] [--threshold PCT] [--hc-url URL]");
         eprintln!("          [--plug-mac <addr>] [--sensor-mac <addr>]");
         eprintln!("  Default plug MAC: {PLUG_MAC}");
@@ -348,6 +348,29 @@ async fn main() {
         "status" => match plug_status(&get_mac(&args, "--mac", PLUG_MAC)).await {
             Ok(s) => println!("{}", if s { "ON" } else { "OFF" }),
             Err(e) => { eprintln!("{e}"); std::process::exit(1); }
+        },
+        "scan" => {
+            let c = adapter().await;
+            c.start_scan(ScanFilter::default()).await.unwrap();
+            println!("scanning for 10 seconds...");
+            let mut seen: std::collections::BTreeSet<String> = std::collections::BTreeSet::new();
+            let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
+            while tokio::time::Instant::now() < deadline {
+                for p in c.peripherals().await.unwrap() {
+                    let addr = p.address().to_string();
+                    if seen.insert(addr.clone()) {
+                        if let Ok(Some(pr)) = p.properties().await {
+                            let name = pr.local_name.as_deref().unwrap_or("");
+                            let mfgs: Vec<String> = pr.manufacturer_data.keys().map(|k| format!("0x{k:04X}")).collect();
+                            let mfg = if mfgs.is_empty() { "".into() } else { mfgs.join(",") };
+                            println!("{addr}  {:+3}dBm  {name}  mfg=[{mfg}]",
+                                pr.rssi.unwrap_or(0));
+                        }
+                    }
+                }
+                sleep(Duration::from_millis(200)).await;
+            }
+            c.stop_scan().await.ok();
         },
         "daemon" => {
             env_logger::init();
