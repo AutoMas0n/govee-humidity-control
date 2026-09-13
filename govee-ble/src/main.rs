@@ -144,11 +144,18 @@ async fn handshake(per: &btleplug::platform::Peripheral) -> Result<[u8; 16], Str
     Ok(sk)
 }
 
-async fn init_plug(per: &btleplug::platform::Peripheral, sk: &[u8; 16]) -> Result<(), String> {
+async fn init_plug(per: &btleplug::platform::Peripheral, sk: &[u8; 16], skey: Option<&[u8; 8]>) -> Result<(), String> {
+    // Send secret key or version data via 33 B2
+    if let Some(k) = skey {
+        write_ctrl(per, &encrypt(&frame_from(0x33, 0xB2, k), sk)).await?;
+    } else {
+        // Default version data (works on V1 firmware)
+        write_ctrl(per, &encrypt(&frame_from(0x33, 0xB2, &[0x3C,0x9C,0x9D,0x89,0x09,0x40,0xB0,0x19]), sk)).await?;
+    }
     write_ctrl(per, &encrypt(&frame_from(0xAA, 0xEF, &[]), sk)).await?;
-    write_ctrl(per, &encrypt(&frame_from(0x33, 0xB2, &[0x3C,0x9C,0x9D,0x89,0x09,0x40,0xB0,0x19]), sk)).await?;
+    sleep(Duration::from_millis(200)).await;
     write_ctrl(per, &encrypt(&frame_from(0x33, 0xB5, &[0x6A,0xA1,0xBB,0xA7,0x01,0xFC]), sk)).await?;
-    sleep(Duration::from_millis(500)).await;
+    sleep(Duration::from_millis(200)).await;
     write_ctrl(per, &encrypt(&frame_from(0xAA, 0xB0, &[]), sk)).await?;
     write_ctrl(per, &encrypt(&frame_from(0xAA, 0xB0, &[0x00,0x01]), sk)).await?;
     write_ctrl(per, &encrypt(&frame_from(0xAA, 0x12, &[]), sk)).await?;
@@ -158,7 +165,7 @@ async fn init_plug(per: &btleplug::platform::Peripheral, sk: &[u8; 16]) -> Resul
 }
 
 // ========================= PLUG CONNECTION (connect + handshake + init + action) =========================
-async fn try_plug_inner<T, Fut>(plug_mac: &str, action: impl FnOnce(btleplug::platform::Peripheral, [u8; 16]) -> Fut) -> Result<T, String>
+async fn try_plug_inner<T, Fut>(plug_mac: &str, skey: Option<&[u8; 8]>, action: impl FnOnce(btleplug::platform::Peripheral, [u8; 16]) -> Fut) -> Result<T, String>
 where Fut: Future<Output = Result<T, String>>,
 {
     let c = adapter().await;
@@ -168,17 +175,17 @@ where Fut: Future<Output = Result<T, String>>,
     per.discover_services().await.map_err(|e| format!("disc svc: {e}"))?;
     sub_notify(&per).await?;
     let sk = handshake(&per).await?;
-    init_plug(&per, &sk).await?;
+    init_plug(&per, &sk, skey).await?;
     let r = action(per, sk).await;
     drop(c);
     r
 }
 
 // ========================= PLUG COMMANDS (each with own retry) =========================
-async fn plug_on(plug_mac: &str) -> Result<(), String> {
+async fn plug_on(plug_mac: &str, skey: Option<&[u8; 8]>) -> Result<(), String> {
     let mut err = String::new();
     for a in 0..3 {
-        match try_plug_inner(plug_mac, |per, sk| Box::pin(async move {
+        match try_plug_inner(plug_mac, skey, |per, sk| Box::pin(async move {
             let r = write_ctrl(&per, &encrypt(&frame_from(0x33, 0x01, &[0x11]), &sk)).await;
             per.disconnect().await.ok();
             sleep(Duration::from_millis(500)).await;
@@ -191,10 +198,10 @@ async fn plug_on(plug_mac: &str) -> Result<(), String> {
     Err(format!("plug_on failed: {err}"))
 }
 
-async fn plug_off(plug_mac: &str) -> Result<(), String> {
+async fn plug_off(plug_mac: &str, skey: Option<&[u8; 8]>) -> Result<(), String> {
     let mut err = String::new();
     for a in 0..3 {
-        match try_plug_inner(plug_mac, |per, sk| Box::pin(async move {
+        match try_plug_inner(plug_mac, skey, |per, sk| Box::pin(async move {
             let r = write_ctrl(&per, &encrypt(&frame_from(0x33, 0x01, &[0x10]), &sk)).await;
             per.disconnect().await.ok();
             sleep(Duration::from_millis(500)).await;
@@ -207,10 +214,10 @@ async fn plug_off(plug_mac: &str) -> Result<(), String> {
     Err(format!("plug_off failed: {err}"))
 }
 
-async fn plug_status(plug_mac: &str) -> Result<bool, String> {
+async fn plug_status(plug_mac: &str, skey: Option<&[u8; 8]>) -> Result<bool, String> {
     let mut err = String::new();
     for a in 0..3 {
-        match try_plug_inner(plug_mac, |per, sk| Box::pin(async move {
+        match try_plug_inner(plug_mac, skey, |per, sk| Box::pin(async move {
             write_ctrl(&per, &encrypt(&frame_from(0xAA, 0x01, &[]), &sk)).await?;
             let mut s = per.notifications().await.map_err(|e| format!("notif: {e}"))?;
             let d = tokio::time::Instant::now() + Duration::from_secs(2);
@@ -287,7 +294,7 @@ async fn ping_hc(url: &str, fail: bool) {
 
 // ========================= DAEMON =========================
 async fn daemon_loop(interval_s: u64, threshold: u8, hc_url: String,
-                     plug_mac: &str, sensor_mac: &str) {
+                     plug_mac: &str, sensor_mac: &str, plug_skey: Option<[u8; 8]>) {
     log::info!("daemon: interval={interval_s}s threshold={threshold}%");
     let mut last_on: Option<bool> = None;
     loop {
@@ -297,8 +304,8 @@ async fn daemon_loop(interval_s: u64, threshold: u8, hc_url: String,
                 let need_on = h > threshold;
                 if last_on.map(|o| o != need_on).unwrap_or(true) {
                     log::info!("need {}", if need_on { "ON" } else { "OFF" });
-                    if need_on { let _ = plug_on(plug_mac).await; }
-                    else { let _ = plug_off(plug_mac).await; }
+                    if need_on { let _ = plug_on(plug_mac, plug_skey.as_ref()).await; }
+                    else { let _ = plug_off(plug_mac, plug_skey.as_ref()).await; }
                     last_on = Some(need_on);
                 }
                 ping_hc(&hc_url, false).await;
@@ -318,18 +325,29 @@ fn get_mac(args: &[String], name: &str, default: &str) -> String {
     get_arg(args, name).unwrap_or_else(|| default.to_string())
 }
 
+fn parse_skey(args: &[String], name: &str) -> Option<[u8; 8]> {
+    get_arg(args, name).and_then(|s| {
+        let b = hex::decode(s).ok()?;
+        if b.len() != 8 { return None; }
+        let mut k = [0u8; 8];
+        k.copy_from_slice(&b);
+        Some(k)
+    })
+}
+
 #[tokio::main]
 async fn main() {
     let args: Vec<String> = std::env::args().collect();
     if args.len() < 2 {
         eprintln!("Usage: govee-ble <read|on|off|status|scan|daemon>");
         eprintln!("  read:   [--mac <addr>]");
-        eprintln!("  on/off/status: [--mac <addr>]");
+        eprintln!("  on/off/status: [--mac <addr>] [--skey <hex8>]");
         eprintln!("  scan:   (no args, lists all nearby BLE devices 8s)");
         eprintln!("  daemon: [--interval SEC] [--threshold PCT] [--hc-url URL]");
-        eprintln!("          [--plug-mac <addr>] [--sensor-mac <addr>]");
+        eprintln!("          [--plug-mac <addr>] [--sensor-mac <addr>] [--plug-skey <hex8>]");
         eprintln!("  Default plug MAC: {PLUG_MAC}");
         eprintln!("  Default sensor MAC: {SENSOR_MAC}");
+        eprintln!("  Secret key (8 hex bytes): --skey f6e0730a5be545e3");
         return;
     }
     match args[1].as_str() {
@@ -337,15 +355,15 @@ async fn main() {
             Ok((t,h,b)) => println!("{t:.1}C {h}% {b}%"),
             Err(e) => { eprintln!("{e}"); std::process::exit(1); }
         },
-        "on" => match plug_on(&get_mac(&args, "--mac", PLUG_MAC)).await {
+        "on" => match plug_on(&get_mac(&args, "--mac", PLUG_MAC), parse_skey(&args, "--skey").as_ref()).await {
             Ok(_) => println!("ON"),
             Err(e) => { eprintln!("{e}"); std::process::exit(1); }
         },
-        "off" => match plug_off(&get_mac(&args, "--mac", PLUG_MAC)).await {
+        "off" => match plug_off(&get_mac(&args, "--mac", PLUG_MAC), parse_skey(&args, "--skey").as_ref()).await {
             Ok(_) => println!("OFF"),
             Err(e) => { eprintln!("{e}"); std::process::exit(1); }
         },
-        "status" => match plug_status(&get_mac(&args, "--mac", PLUG_MAC)).await {
+        "status" => match plug_status(&get_mac(&args, "--mac", PLUG_MAC), parse_skey(&args, "--skey").as_ref()).await {
             Ok(s) => println!("{}", if s { "ON" } else { "OFF" }),
             Err(e) => { eprintln!("{e}"); std::process::exit(1); }
         },
@@ -380,6 +398,7 @@ async fn main() {
                 get_arg(&args, "--hc-url").unwrap_or_default(),
                 &get_mac(&args, "--plug-mac", PLUG_MAC),
                 &get_mac(&args, "--sensor-mac", SENSOR_MAC),
+                parse_skey(&args, "--plug-skey"),
             ).await;
         }
         _ => { eprintln!("unknown: {}", args[1]); std::process::exit(1); }
