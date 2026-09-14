@@ -244,6 +244,45 @@ async fn plug_status(plug_mac: &str, skey: Option<&[u8; 8]>) -> Result<bool, Str
     Err(format!("plug_status failed: {err}"))
 }
 
+// ========================= SECRET KEY EXTRACTION =========================
+async fn get_skey(plug_mac: &str) -> Result<String, String> {
+    let c = adapter().await;
+    let per = find_mac(&c, plug_mac, 10).await?;
+    per.connect().await.map_err(|e| format!("conn: {e}"))?;
+    sleep(Duration::from_millis(500)).await;
+    per.discover_services().await.map_err(|e| format!("disc svc: {e}"))?;
+    sub_notify(&per).await?;
+    let sk = handshake(&per).await?;
+    
+    // Send AA B1 to read secret key
+    write_ctrl(&per, &encrypt(&frame_from(0xAA, 0xB1, &[]), &sk)).await?;
+    
+    let mut s = per.notifications().await.map_err(|e| format!("notif: {e}"))?;
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(3);
+    while tokio::time::Instant::now() < deadline {
+        let n = tokio::time::timeout(Duration::from_millis(500), s.next()).await.ok().and_then(|x| x);
+        if let Some(v) = n {
+            let mut buf = [0u8; 20];
+            let l = v.value.len().min(20);
+            buf[..l].copy_from_slice(&v.value[..l]);
+            let dec = decrypt(&buf, &sk);
+            if dec[0] == 0xAA && dec[1] == 0xB1 && verify(&dec) {
+                // Extract non-zero bytes (the secret key)
+                let key_bytes = &dec[2..19];
+                let nz: Vec<u8> = key_bytes.iter().copied().filter(|&b| b != 0).collect();
+                if !nz.is_empty() {
+                    per.disconnect().await.ok();
+                    drop(c);
+                    return Ok(hex::encode(&nz));
+                }
+            }
+        }
+    }
+    per.disconnect().await.ok();
+    drop(c);
+    Err("no secret key response (V1 firmware?)".into())
+}
+
 // ========================= H5179 =========================
 fn parse_h5179(data: &[u8]) -> Option<(f32, u8, u8)> {
     if data.len() < 7 || data[0] != 0x88 || data[1] != 0xEC { return None; }
@@ -339,10 +378,11 @@ fn parse_skey(args: &[String], name: &str) -> Option<[u8; 8]> {
 async fn main() {
     let args: Vec<String> = std::env::args().collect();
     if args.len() < 2 {
-        eprintln!("Usage: govee-ble <read|on|off|status|scan|daemon>");
+        eprintln!("Usage: govee-ble <read|on|off|status|scan|get-skey|daemon>");
         eprintln!("  read:   [--mac <addr>]");
         eprintln!("  on/off/status: [--mac <addr>] [--skey <hex8>]");
-        eprintln!("  scan:   (no args, lists all nearby BLE devices 8s)");
+        eprintln!("  scan:   (no args, lists all nearby BLE devices 10s)");
+        eprintln!("  get-skey: --mac <addr> (reads secret key from plug)");
         eprintln!("  daemon: [--interval SEC] [--threshold PCT] [--hc-url URL]");
         eprintln!("          [--plug-mac <addr>] [--sensor-mac <addr>] [--plug-skey <hex8>]");
         eprintln!("  Default plug MAC: {PLUG_MAC}");
@@ -389,6 +429,14 @@ async fn main() {
                 sleep(Duration::from_millis(200)).await;
             }
             c.stop_scan().await.ok();
+        },
+        "get-skey" => {
+            let mac = &get_mac(&args, "--mac", "");
+            if mac.is_empty() { eprintln!("--mac <addr> required"); std::process::exit(1); }
+            match get_skey(mac).await {
+                Ok(key) => println!("{}", key),
+                Err(e) => { eprintln!("{e}"); std::process::exit(1); }
+            }
         },
         "daemon" => {
             env_logger::init();
