@@ -5,235 +5,224 @@ Replace the Govee Home cloud app with a standalone local BLE solution for contro
 Govee H5080 smart plugs and reading H5179 humidity sensors. Zero cloud dependency.
 No enshittification. Runs on a Raspberry Pi 4 (Debian 12, armv7l).
 
-## What Works (Proven)
+**Status (2026-09-16 end of session):** protocol is fully understood, including
+app-free pairing. `govee-ble pair` is built on the Pi and ran once against E1DD
+(timed out — user was not at the plug to press the button). The only remaining
+blocker is a physical button press.
 
-### H5179 Humidity Sensor
-- BLE advertisements broadcast temperature/humidity every ~10 seconds
-- Works via any BLE scanner — no pairing, no connection needed
-- Data in manufacturer-specific advertisement fields
-- Python reader in `h5080_controller.py`, Rust reader in `govee-ble/src/main.rs`
+---
 
-### H5080 Smart Plug (V1 Firmware)
-- **MAC**: `60:74:F4:BD:4D:E5` (also known as 4DE5)
-- **BLE toggle works without secret key**
-- Uses the default version data `3c9c9d890940b019` for the `33 B2` command
-- 7 init commands all respond (AA EF, 33 B2, 33 B5, AA B0×2, AA 12, AA 13)
-- Soft version = `00` (field in AA response)
-- Currently unreachable — may need power cycle
+## TL;DR — The Secret Key Mystery Is Solved
 
-### H5080 Smart Plug (V2+ Firmware, E245)
-- **MAC**: `D4:AD:FC:42:E2:45`
-- **BLE toggle works WITH secret key**: `f6e0730a5be545e3`
-- Extracted from btsnoop capture of Govee app traffic
-- Secret key was written by the Govee app during initial pairing
-- Verified: OFF → ON cycle works from Raspberry Pi
-- Dehumidifier plug (user-labelled)
+Newer H5080 firmware (E245, E1DD) requires an 8-byte per-plug "secret key"
+before `33 01` toggles work. Previous sessions assumed the Govee app generated
+and wrote this key, and hunted for its algorithm / phone storage. **Wrong.**
 
-### H5080 Smart Plug (V2+ Firmware, E1DD)
-- **MAC**: `D4:AD:FC:41:E1:DD`
-- **BLE status query works, toggle does NOT** — secret key unknown
-- Same key as E245? `f6e0730a5be545e3` — tested, does NOT toggle (each plug has its own)
-- **No capture of E1DD exists**: the 09-16 "E1DD re-pairing" bugreport is actually 14× E245 + 2× 4DE5
-- **Next step**: `sudo govee-ble pair --mac D4:AD:FC:41:E1:DD`, short-press the plug button when prompted
+**The plug owns the key. The app only reads it, and only after a physical
+button press.** Decompiled from `SecretKeyController` (`base/classes10.dex`)
+and verified byte-for-byte against the 2026-09-16 btsnoop:
 
-## Protocol
-
-Full protocol documentation: see **PROTOCOL.md**
-
-### Summary
-- **GATT**: Service `00010203-0405-0607-0809-0a0b0c0d1910`
-  - Write char: `...2b11` (handle 0x0011)
-  - Notify char: `...2b10` (handle 0x000E or 0x000D depending on device)
-- **Crypto**: AES-128-ECB (first 16 bytes) + RC4 (last 4 bytes)
-- **Static key**: `b"MakingLifeSmarte"` (16 bytes)
-- **Frame format**: 20 bytes: `[cmd sub data(0-16) 0x00-padding XOR-checksum]`
-- **Handshake**: E7 01 (request) → E7 01 (response with session key) → E7 02 (confirm)
-- **Session key**: 16 bytes from handshake, used for all subsequent frames
-
-### Commands (All 20 bytes, encrypted with session key)
-| Command | Hex | Description |
-|---------|-----|-------------|
-| Status query | `AA 01` | Returns state (0=OFF, 1=ON) |
-| Toggle ON | `33 01 11` | Turn plug ON |
-| Toggle OFF | `33 01 10` | Turn plug OFF |
-| Secret key check | `33 B2 <8B key>` | Check key → `33 B2 00` = ok |
-| Secret key read | `AA B1` | → `AA B1 <flag> <8B>`; flag 01 only after button press |
-| Sync time | `33 B5 <ts BE×4> 01 <tz_h> <tz_m>` | SyncTime (unix ts + UTC offset) |
-| Init handshake | `AA EF` | Device init |
-| Plug config | `AA B0` | Read plug config |
-| Plug config | `AA B0 00 01` | Plug config variant |
-| Timer count | `AA 12` | Number of timers |
-| Timer data | `AA 13` | Timer data |
-| MFR info | `AA 06` | Manufacturer info |
-| MFR info | `AA 07 <type>` | Manufacturer info query |
-| Unknown | `AA 21` | Seen in pairing |
-| Unknown | `AA 20` | Seen in pairing |
-| Unknown | `AA 14` | Seen in pairing |
-| Unknown | `AA B3` | Seen in pairing |
-| Pair confirm | `AB 01 04` | Pairing confirmation command |
-
-### Init Sequences
-
-**V1 firmware (4DE5)** — no secret key needed:
 ```
-AA EF → 33 B2(3c9c9d890940b019) → 33 B5(6aa1bba701fc) → AA B0 → AA B0 00 01 → AA 12 → AA 13
+AA B1            -> AA B1 00 <8 random bytes>    "not confirmed" (app polls every ~240 ms)
+  ...user SHORT-PRESSES the plug's button...
+AA B1            -> AA B1 01 <8-byte KEY>        real key, persistent per plug
+33 B2 <KEY>      -> 33 B2 00                     per-session check (never a SET)
+33 01 11 / 10    -> 33 01 00                     toggle now works
 ```
 
-**V2+ firmware (E245, E1DD)** — secret key required:
+- Session 13 of the 09-16 capture (E245): 46× `AA B1 00 …`, then
+  `AA B1 01 f6e0730a5be545e3` at 12.25 s — the same key E245 had before, so
+  the key survives re-pairing. No generation, no reset, no cloud.
+- The old `get-skey` reported the random bytes from `AA B1 00` because it
+  ignored the flag byte. That's the whole "dynamic challenge" red herring.
+- App UI string during this phase: `plug_single_pair_press_hint` =
+  *"The device's power indicator is slowly flashing blue. Please short press its
+  switch button to pair."* Pairing-mode entry string: `plugv1_guide_des_v1` =
+  *"Press and hold the button until the indicator light slowly blinks blue."*
+- `AB 01 04` + `AA 06/07/14/20/21/B3` after the key check are firmware/hw
+  version, WiFi MAC and an IoT credential token — cloud provisioning, **not
+  needed** for BLE control.
+- `33 B5` is **SyncTime** (`[unix_ts BE×4][01][tz_hours i8][tz_min]`), not a
+  hardware version write. `FC` = UTC-4.
+
+---
+
+## NEXT ACTION (do this first)
+
+Someone must be physically at plug **E1DD** (`D4:AD:FC:41:E1:DD`).
+
+```bash
+ssh pi@192.168.2.21
+cd ~/Github/govee-humidity-control/govee-ble
+sudo ./target/release/govee-ble pair --mac D4:AD:FC:41:E1:DD --timeout 120
 ```
-33 B2(<8B secret key>) → 33 B5(6aa4a43a01fc) → AA EF → AA B0 → AA B0 00 01 → AA 12
-```
 
-### Full Pairing Sequence (from btsnoop capture)
-Used when app pairs with a new (or forgotten) device:
-```
-1. E7 01/02 handshake
-2. AA B1 polled every ~240ms → `00 <random>` until user SHORT-PRESSES plug button → `01 <key>`
-3. 33 B2(<8B key>) → 33 B2 00 (check key)
-4. AA 06
-5. AA 07(03)
-6. AA 21
-7. AA 20
-8. AA 14
-9. AA B3
-10. AA 07(02)
-11. AB 01(04) (pair confirm)
-12. Handle 0x0025: WiFi provisioning data (not needed for BLE-only)
-```
+It prints `connected. >>> SHORT-PRESS the button on the plug now <<<` and then
+one token per poll: `00` = plug answering "not confirmed", `-` = no reply.
 
-## Secret Key
+1. **Try normal mode first:** short-press the E1DD button once.
+2. If no key within ~20 s: **hold** the button until the LED slowly blinks
+   blue (pairing mode), then short-press again.
+3. On success it prints the 8-byte hex key on stdout and
+   `paired. use: --skey <key>` on stderr. Then verify:
+   ```bash
+   sudo ./target/release/govee-ble on  --mac D4:AD:FC:41:E1:DD --skey <key>
+   sudo ./target/release/govee-ble off --mac D4:AD:FC:41:E1:DD --skey <key>
+   ```
+4. Record the key in PROTOCOL.md "Secret Keys (Captured)" table and here.
+5. Answer the open question: did normal-mode short-press work, or was
+   pairing mode required? Update PROTOCOL.md accordingly.
 
-### What We Know
-- **Key for E245**: `f6e0730a5be545e3` (8 bytes, verified working)
-- **Key for 4DE5**: None needed (V1 firmware)
-- **Key for E1DD**: Unknown — need to extract
-- **The plug owns the key.** The app never generates it. `SecretKeyController`
-  (decompiled from `base/classes10.dex` → `~/govee_apk/skc/`) only READS it:
-  - `AA B1` response: `AA B1 <flag> <8 bytes>`. `parseValidBytes` requires `flag == 0x01`;
-    otherwise it fails and `AbsPairAc4SecretV1` retries after 200 ms.
-  - `flag == 0x00` responses carry **random bytes** — this is what the old
-    `get-skey` printed and why it looked like a "dynamic challenge".
-  - The plug flips to `flag == 0x01` when the user **short-presses its button**
-    (app string `plug_single_pair_press_hint`).
-  - Key read back on re-pair == key from first pair → persistent per plug.
-- `33 B2 <key>` → `33 B2 00` is a CHECK done once per session; a wrong key is silently ignored.
-- The app stores keys in `SecretKeyConfig` (HashMap<String, String> keyed by BLE MAC) — irrelevant for us now.
-- Verified against 2026-09-16 capture (Session 13, E245): 46× `AA B1 00 …`, then `AA B1 01 f6e0730a5be545e3`.
+Sanity check that pairing works at all: run the same against E245
+(`D4:AD:FC:42:E2:45`) — it should return `f6e0730a5be545e3`.
 
-### Implemented
-`govee-ble pair --mac <addr> [--timeout 60]` does exactly the app's flow, prints the key.
-Not yet run against real hardware — needs the Pi (btleplug won't build on Termux/Android).
+---
 
-## Architecture
+## Devices
 
-### Raspberry Pi (Target)
-- **Host**: `raspberrypi` (192.168.2.21)
-- **OS**: Debian 12 Bookworm, armv7l
-- **Python**: 3.11.2 with bleak 3.0.2, pycryptodomex
-- **Rust**: 1.75+ (via rustup), btleplug 0.11, tokio, aes crate
-- **BLE**: CYW43455 UART (built-in), works with kernel 6.1.21
+| Plug | MAC | Firmware | Secret key | State |
+|------|-----|----------|-----------|-------|
+| 4DE5 | `60:74:F4:BD:4D:E5` | V1 | none needed (`33 B2 3c9c9d890940b019` default works) | visible in scan again (was unreachable) |
+| E245 | `D4:AD:FC:42:E2:45` | V2+ | `f6e0730a5be545e3` (verified toggles) | working; dehumidifier plug |
+| E1DD | `D4:AD:FC:41:E1:DD` | V2+ | **unknown — run `pair`** | status works, toggle no-ops |
+| H5179 | `E3:32:81:12:40:A4` | sensor | n/a | advertisements, mfg id `0x8801` |
 
-### Code Assets
+All plugs advertise as `ihoment_H5080_XXXX`, manufacturer id `0x8843`.
 
-| File | Description |
-|------|-------------|
-| `govee-ble/src/main.rs` | Rust binary — single-file, ~400 lines |
-| `govee-ble/Cargo.toml` | Rust dependencies |
-| `h5080_controller.py` | Python BLE controller (reference implementation) |
-| `scripts/govee_ble_protocol.py` | Crypto library and key definitions |
-| `scripts/get_skey.py` | (obsolete — ignores the flag byte) |
-| `scripts/decode_sessions.py` | Decrypt all writes+notifies per session from a btsnoop, with peer MAC |
-| `scripts/parse_btsnoop.py` | Parse btsnoop log to extract ATT writes |
-| `scripts/analyze_btsnoop.py` | Session analysis and command extraction |
-| `scripts/decrypt_e245.py` | E245-specific btsnoop decryption |
-| `scripts/extract_skey.py` | Extract secret key from btsnoop |
-| `PROTOCOL.md` | Full protocol documentation |
-| `captured_payloads.txt` | Raw payloads from btsnoop captures |
+**Important:** the 09-16 bugreport labelled "E1DD re-pairing" contains **zero
+E1DD sessions** (14× E245, 2× 4DE5). E1DD's key has never been observed.
+Nothing about E1DD is broken; it just needs `pair`.
 
-**BTSnoop captures** (on Android device, bugreport zips):
-- `bugreport-*-2026-09-15-*` — E245 toggle (8 sessions, all with `f6e0730a5be545e3`)
-- `bugreport-*-2026-09-16-*` — E245 re-pairing (14 sessions E245, 2 sessions 4DE5; **no E1DD**). Extracted to `~/btsnoop_0916/`
+---
 
-### Rust Binary (`govee-ble`)
-Commands:
+## Protocol (summary — full detail in PROTOCOL.md)
+
+- **GATT**: service `00010203-0405-0607-0809-0a0b0c0d1910`, write `…2b11`
+  (handle 0x0011), notify `…2b10` (handle 0x000E / 0x000D)
+- **Frame**: 20 bytes `[cmd sub data… 0x00-pad XOR-checksum]`
+- **Crypto**: AES-128-ECB on bytes 0..16 + RC4 on bytes 16..20
+- **Static key**: `b"MakingLifeSmarte"` (from APK resource strings)
+- **Handshake** (static key): `E7 01 <16 rand>` → notify `E7 01 <16B session key>` → `E7 02 <16 rand>`
+- Everything after the handshake is encrypted with the **session key**
+
+| Cmd | Response | Meaning |
+|-----|----------|---------|
+| `AA 01` | `AA 01 <0/1>` | status query |
+| `33 01 11` / `33 01 10` | `33 01 00` | ON / OFF |
+| `AA B1` | `AA B1 <flag> <8B>` | read secret key; flag 01 only after button press |
+| `33 B2 <8B>` | `33 B2 00` | check secret key (per session, before toggle) |
+| `33 B5 <ts×4> 01 <tz_h> <tz_m>` | `33 B5 00` | SyncTime |
+| `AA EF` | | init (V1 only responds meaningfully) |
+| `AA B0` / `AA B0 00 01` | echo | plug config |
+| `AA 12` / `AA 13` | | timer count / data |
+| `AA 06` / `AA 21` | ASCII `"1.00.28"` | firmware version |
+| `AA 07 03` / `AA 20` | ASCII `"1.02.00"` | hardware version |
+| `AA 14` | 6 bytes | WiFi MAC (= BLE MAC − 1) |
+| `AA 07 02` | reversed BLE MAC + 2B | ? |
+| `AB 01 04` | multi-frame `AB 00..05` ASCII token | IoT credential — cloud only |
+
+**Init used by `govee-ble`** (works on V1 and V2+):
+`33 B2 <key or default>` → `AA EF` → `33 B5 <now>` → `AA B0` → `AA B0 00 01` → `AA 12` → `AA 13` → then toggle.
+
+---
+
+## Code
+
+### Rust binary `govee-ble/` (single file `src/main.rs`, ~470 lines)
+
 | Subcommand | Args | Description |
 |------------|------|-------------|
-| `on` | `--mac <addr>` `[--skey <hex8>]` | Turn plug ON |
-| `off` | `--mac <addr>` `[--skey <hex8>]` | Turn plug OFF |
-| `status` | `--mac <addr>` `[--skey <hex8>]` | Query plug state |
-| `read` | `--mac <addr>` | Read H5179 sensor |
-| `scan` | (none) | List nearby BLE devices (10s scan) |
-| `pair` | `--mac <addr>` `[--timeout <sec>]` | App-free pairing: prints plug's secret key after button press |
-| `daemon` | `--plug-mac <addr>` `--sensor-mac <addr>` `[--plug-skey <hex8>]` `[--interval <sec>]` `[--threshold <%>]` `[--hc-url <url>]` | Continuous humidity-based control loop |
+| `scan` | | list BLE devices, 10 s |
+| `read` | `--mac` | H5179 temp/humidity/battery |
+| `on` / `off` / `status` | `--mac` `[--skey <hex8>]` | plug control (3 retries) |
+| `pair` | `--mac` `[--timeout 60]` | **app-free pairing**: polls `AA B1`, prints key after button press, checks with `33 B2`. `get-skey` is an alias. |
+| `daemon` | `--plug-mac --sensor-mac [--plug-skey] [--interval] [--threshold] [--hc-url]` | humidity control loop |
 
-`pair` implemented (this session), compiles on the Pi only. Untested on hardware.
+Deps: `btleplug`, `tokio`, `aes`, `futures`, `hex`, `log`, `env_logger`.
+No clap/reqwest/anyhow. ~1.5 MB release binary. `TZ_HOURS` const = -4.
 
-### Dependencies (ponytail-minimal)
-- **Rust**: `btleplug`, `tokio`, `aes`, `log`, `env_logger`, `hex`
-- No clap (manual argv parsing), no reqwest (TCP healthcheck), no thiserror/anyhow
-- Single source file, ~1.5MB release binary
+**Build only on the Pi.** btleplug pulls in `jni` on Android targets, so
+`cargo check` fails on Termux. Non-interactive SSH lacks `~/.cargo/bin` in PATH:
 
-### Raspberry Pi Paths
-- Repo: `~/Github/govee-humidity-control/`
-- Binary: `govee-ble/target/release/govee-ble`
-- systemd: Not yet set up (planned)
+```bash
+ssh pi@192.168.2.21 'export PATH=$HOME/.cargo/bin:$PATH; cd ~/Github/govee-humidity-control && git pull && cd govee-ble && cargo build --release'
+```
+(`/usr/bin/cargo` is 1.65 and can't read the v4 lockfile; rustup's is 1.98.)
 
-### Android Tools (Motorola g86 power 5G)
-- ADB wireless debugging (ports rotate frequently)
-- Bugreport via Developer Options → Interactive report
-- BTSnoop enabled: `adb shell settings put global bluetooth_hci_snoop_log 1`
-- APK decompiled with jadx 1.5.5
+### Scripts (Python, Termux side — analysis only)
 
-## Resolved Questions (2026-09-16 session)
+| File | Purpose |
+|------|---------|
+| `scripts/decode_sessions.py <btsnoop.log> [--filter aab1]` | **The useful one.** Decrypts every write AND notification, grouped per E7 session, with peer MAC. Needs `pycryptodome`. |
+| `scripts/govee_ble_protocol.py` | crypto helpers |
+| `scripts/parse_btsnoop.py`, `analyze_btsnoop.py`, `extract_skey.py`, `decrypt_e245.py` | older one-off analyses (writes only) |
+| `h5080_controller.py` | Python reference controller (bleak) |
 
-1. ~~Can `33 B2` SET a key?~~ No. It's a check. The plug owns the key; nothing sets it.
-2. ~~How does the app generate keys?~~ It doesn't. `SecretKeyController.parseValidBytes` reads
-   `AA B1 01 <key>` from the plug. Decompiled to `~/govee_apk/skc/`.
-3. ~~Extract keys from phone?~~ Unnecessary — read from the plug with a button press.
-4. ~~Factory reset?~~ Not needed. App guide: hold button until LED slowly blinks blue = pairing mode.
-5. ~~Does AB 01 04 commit the key?~~ No. It fetches an IoT/cloud credential token. BLE-only ignores it.
-6. ~~Why doesn't E1DD toggle?~~ We never had its key; its "capture" was actually E245.
+### Reverse-engineering artefacts on the phone (Termux `~`)
 
-## Open
+| Path | What |
+|------|------|
+| `~/govee_apk/base.apk`, `split_pact_h5080.apk` | pulled APKs |
+| `~/govee_apk/h5080/classes/sources/com/govee/h5080/` | jadx-decompiled H5080 module (`add/AbsPairAc4SecretV1.java` = pairing state machine, `ble/controller/SyncTimeController.java`, …) |
+| `~/govee_apk/skc/` | `SecretKeyController.java`, `EventSecretKey.java`, `AbsSingleController.java` etc. — extracted with `jadx --single-class com.govee.base2light.ble.controller.SecretKeyController base/classes10.dex` |
+| `~/govee_apk/base_full/resources/res/values/strings.xml` | UI strings (`plug_*_press_hint`) |
+| `~/btsnoop_0916/btsnoop_hci.log` | 09-16 capture (E245 re-pair, contains the `AA B1 01` proof) |
+| `~/btsnoop_e1dd/btsnoop_hci.log` | 09-15 capture (E245 toggles despite the dir name) |
+| `~/bugreport*.zip`, `/storage/emulated/0/Download/bugreport-*.zip` | raw bugreports; btsnoop at `FS/data/misc/bluetooth/logs/btsnoop_hci.log` |
 
-1. Does `AA B1` unlock on a short press while the plug is in *normal* mode, or must it be in
-   pairing mode (long-press → slow blue blink) first? Try normal mode first.
-2. Run `pair` on E1DD from the Pi, then verify `on/off --skey <key>`.
-3. 4DE5 is unreachable — power cycle it.
-4. systemd unit for `daemon` on the Pi.
+---
 
-## Git History
+## Infrastructure
 
-**Branch**: `main`
-- `f097dd1` — Clean repo, BLE controller works, Rust rewrite
-- `f52d541` — OpenSpec change created
-- `70c4ee8` — scan subcommand
-- `6f26268` — --skey flag
-- `cf0120f` — get-skey subcommand
-- `8cfa645` — PROTOCOL.md update with firmware variants + secret keys
-- `d809d74` — HANDOVER.md
-- Latest: `pair` subcommand + decode_sessions.py + protocol corrections (secret key is plug-owned, read via AA B1 after button press)
+**Raspberry Pi** — `pi@192.168.2.21`, Debian 12 armv7l, kernel 6.1, CYW43455 BLE.
+Repo `~/Github/govee-humidity-control/`, binary `govee-ble/target/release/govee-ble`
+(needs `sudo`). Rust via rustup (`~/.cargo/bin`). systemd unit **not yet created**.
+
+**Android** — Motorola g86 power 5G, Termux. ADB wireless (port rotates).
+btsnoop: `adb shell settings put global bluetooth_hci_snoop_log 1`, then
+Developer Options → Bug report → Interactive. jadx 1.5.5 installed in Termux.
+
+---
+
+## Open Items
+
+1. **Run `pair` on E1DD** with someone at the plug (see NEXT ACTION).
+   Determine whether normal-mode short-press suffices or pairing mode is needed.
+2. Re-verify 4DE5 toggles (it's back in scan results).
+3. systemd unit for `daemon` (E245 = dehumidifier, sensor 40A4).
+4. Optional cleanup: drop the older one-off scripts now that `decode_sessions.py` supersedes them.
+5. Optional: `pair` could persist keys to a config file instead of requiring `--skey` on every call.
+
+## Resolved (don't re-investigate)
+
+- ~~How does the app generate the key?~~ It doesn't; the plug does. Read via `AA B1` after button press.
+- ~~Can `33 B2` set a key / is there a factory reset?~~ `33 B2` is a check. No set exists, none needed.
+- ~~Extract keys from phone storage / `adb backup`?~~ Unnecessary.
+- ~~Does `AB 01 04` commit the key?~~ No, it fetches an IoT token.
+- ~~Why doesn't E1DD toggle?~~ Never had its key. No E1DD capture exists.
+- ~~What is `33 B5`?~~ SyncTime.
+
+---
+
+## Git History (branch `main`)
+
+- `f097dd1` clean repo, BLE controller works, Rust rewrite
+- `70c4ee8` scan · `6f26268` --skey · `cf0120f` get-skey (broken, superseded)
+- `8cfa645` PROTOCOL.md firmware variants · `d809d74` HANDOVER.md
+- `b0f2d44` **`pair` subcommand; secret key is plug-owned; decode_sessions.py; docs corrected**
+- `+1` Cargo.lock revert · `+1` pair: per-poll flag output
+- Pushed to origin and pulled/built on the Pi.
 
 ## Quick Start
 
 ```bash
-# Scan for plugs
-sudo govee-ble scan
-
-# Control E245 (key known)
-sudo govee-ble on --mac D4:AD:FC:42:E2:45 --skey f6e0730a5be545e3
-sudo govee-ble off --mac D4:AD:FC:42:E2:45 --skey f6e0730a5be545e3
-
-# Read H5179 sensor
-sudo govee-ble read --sensor-mac E3:32:81:12:40:A4
-
-# Pair E1DD without the Govee app (short-press the plug's button when prompted)
-sudo govee-ble pair --mac D4:AD:FC:41:E1:DD
-# -> prints 8-byte hex key; then:
-sudo govee-ble on --mac D4:AD:FC:41:E1:DD --skey <key>
-
-# Daemon mode (humidity-based control loop)
-sudo govee-ble daemon --plug-mac D4:AD:FC:42:E2:45 --plug-skey f6e0730a5be545e3 \
+# on the Pi, in govee-ble/
+sudo ./target/release/govee-ble scan
+sudo ./target/release/govee-ble pair --mac D4:AD:FC:41:E1:DD --timeout 120   # press plug button
+sudo ./target/release/govee-ble on  --mac D4:AD:FC:42:E2:45 --skey f6e0730a5be545e3
+sudo ./target/release/govee-ble off --mac D4:AD:FC:42:E2:45 --skey f6e0730a5be545e3
+sudo ./target/release/govee-ble read --mac E3:32:81:12:40:A4
+sudo ./target/release/govee-ble daemon --plug-mac D4:AD:FC:42:E2:45 --plug-skey f6e0730a5be545e3 \
   --sensor-mac E3:32:81:12:40:A4 --interval 60 --threshold 60 --hc-url http://your-id.healthchecks.io
 ```
 
