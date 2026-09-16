@@ -283,8 +283,10 @@ async fn pair(plug_mac: &str, timeout_s: u64) -> Result<String, String> {
     let mut key = None;
     while key.is_none() && tokio::time::Instant::now() < deadline {
         write_ctrl(&per, &encrypt(&frame_from(0xAA, 0xB1, &[]), &sk)).await?;
-        if let Some(f) = wait_frame(&mut s, &sk, 0xAA, 0xB1, 1).await {
-            if f[2] == 0x01 { let mut k = [0u8; 8]; k.copy_from_slice(&f[3..11]); key = Some(k); }
+        match wait_frame(&mut s, &sk, 0xAA, 0xB1, 1).await {
+            Some(f) if f[2] == 0x01 => { let mut k = [0u8; 8]; k.copy_from_slice(&f[3..11]); key = Some(k); }
+            Some(f) => eprint!("{:02x} ", f[2]),
+            None => eprint!("- "),
         }
         sleep(Duration::from_millis(250)).await;
     }
