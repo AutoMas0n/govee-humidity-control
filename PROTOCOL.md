@@ -185,6 +185,40 @@ Device responds with NOTIFY: `33 01 00 00 ... [checksum]`
 
 Device responds with NOTIFY: `33 01 00 00 ... [checksum]`
 
+## Full Pairing Sequence
+
+When the Govee app pairs with a new (or forgotten) device, it sends this
+sequence after the E7 handshake. This is the **complete protocol for replacing
+the Govee app** with our own pairing logic.
+
+```
+Phase 1: Challenge reads (may be a "warmup" to unlock the plug)
+  AA B1 × 47+   (read secret key challenge, interleaved with AA 01 status)
+
+Phase 2: Write secret key
+  33 B2 <8-byte key>   (write/verify the secret key)
+
+Phase 3: Device info queries
+  AA 06         (manufacturer info query)
+  AA 07 03      (manufacturer info variant)
+  AA 21         (unknown - seen in pairing)
+  AA 20         (unknown - seen in pairing)
+  AA 14         (unknown - seen in pairing)
+  AA B3         (unknown - seen in pairing)
+  AA 07 02      (manufacturer info variant)
+
+Phase 4: Pair confirm
+  AB 01 04      (pairing confirmation - commits the key)
+
+Phase 5: WiFi provisioning (on handle 0x0025, not needed for BLE-only)
+  ...20-byte data frames...
+```
+
+**Note**: The `33 B2` appears to be a **verify** operation — the plug checks
+the key against its stored value. Writing a different key than what the plug
+expects is silently rejected (toggle commands won't work). The mechanism for
+SETTING a new key (factory reset or pairing mode) is not yet understood.
+
 ## Usage
 
 From the Raspberry Pi (or any Linux with Bluetooth + bleak):
@@ -257,8 +291,27 @@ govee-ble get-skey --mac D4:AD:FC:41:E1:DD
 | `scripts/govee_ble_protocol.py` | Crypto library and key definitions |
 | `scripts/parse_btsnoop.py` | BTSnoop → ATT write extraction |
 
-## Archived Approaches
+## Key Unanswered Questions
 
-See `openspec/changes/archive/` for failed attempts:
-- `h5080-ble-protocol` — Guessed V2 crypto (wrong)
+1. **Can `33 B2` SET a new key on a factory-reset plug?**
+   - Not proven — our plugs were all already paired
+   - Need a genuinely factory-fresh plug or known reset procedure
+   
+2. **How does the app generate secret keys?**
+   - `SecretKeyController` class is in a compiled library (not decompiled)
+   - Found in `classes2.dex`, `classes3.dex`, `classes4.dex`, `classes10.dex`
+   
+3. **Can we extract stored keys from the phone without root?**
+   - Try: `adb backup -f backup.ab com.govee.home` (needs phone confirmation)
+   - Then: `(printf "\\x1f\\x8b\\x08\\x00\\x00\\x00\\x00\\x00"; tail -c +25 backup.ab) | gunzip | tar xvf -`
+   
+4. **What resets the H5080 to factory state?**
+   - Long press (10s+) the physical button?
+   - Power cycle pattern?
+   
+5. **Does `AB 01 04` commit the secret key?**
+   - Seen after 33 B2 in the pairing capture
+   - Might finalize the pairing and save the key permanently
+
+See `HANDOVER.md` for full context and next steps.
 - `h5080-ble-alternative` — Hybrid cloud approach (rejected)
