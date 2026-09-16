@@ -108,30 +108,45 @@ to the plug once during setup and reused every session.
 
 ## Secret Key Exchange
 
-Newer firmware variants require a secret key write before the toggle will work.
-The key is 8 bytes, device-specific, set during initial app pairing.
+Newer firmware variants require a secret key check before the toggle will work.
+The key is 8 bytes, **owned by the plug** (persistent, survives re-pairing).
+The app never generates it — it *reads* it from the plug once during pairing
+(`SecretKeyController`, `base2light/ble/controller`, classes10.dex) and stores
+it in `SecretKeyConfig`. No app or cloud is required to obtain it.
 
-### Reading the Secret Key (Challenge)
+### Reading the Secret Key (AA B1) — requires physical button press
 
 ```
 Cmd:   AA B1 [padding] [XOR]
-Resp:  AA B1 [8 key bytes] [padding] [XOR]
+Resp:  AA B1 <flag> [8 bytes] [padding] [XOR]
+         flag = 0x00 → not confirmed; the 8 bytes are RANDOM junk
+         flag = 0x01 → the 8 bytes are the real secret key
 ```
 
-Note: `AA B1` returns a **different value each session** — it's a dynamic
-challenge, not the persistent stored key. The actual working key must be
-captured from a btsnoop during the initial pairing flow, or extracted from the
-Govee app's `SecretKeyConfig`.
+The plug answers `00 <random>` until the user **short-presses the plug's
+button**, then answers `01 <key>`. The app polls every ~250 ms with the UI text
+*"Please short press its switch button to pair"*. Verified in the 2026-09-16
+capture: 46× `AA B1 00 …`, then `AA B1 01 f6e0730a5be545e3` right after the press.
 
-### Writing the Secret Key
+### Checking the Secret Key (33 B2)
 
 ```
 Cmd:   33 B2 [8 secret key bytes] [padding] [XOR]
-Resp:   [none/ack]
+Resp:  33 B2 <status>    status 0x00 = accepted
 ```
 
-The app writes the key during initial setup. Our controller sends this write
-when `--skey` is provided.
+Sent once per session before any `33 01` toggle. A wrong key is silently
+rejected (toggle no-ops). `govee-ble` sends it when `--skey` is given.
+
+### App-free pairing (`govee-ble pair --mac <addr>`)
+
+1. Connect, E7 handshake
+2. Poll `AA B1` until `flag == 01` (short-press the plug button)
+3. `33 B2 <key>` → expect `33 B2 00`
+4. Save key; use `--skey <key>` for every subsequent on/off/status
+
+`AB 01 04` and the `AA 06/07/14/20/21/B3` info reads that follow in the app's
+pairing capture are WiFi/IoT credential provisioning — not needed for BLE.
 
 ## Plug Initialization (Required before toggle)
 
@@ -142,7 +157,7 @@ The init sequence differs between firmware variants:
 |-------|-----|-----|------|-------------|
 | 1 | `AA` | `EF` | none | Initial handshake |
 | 2 | `33` | `B2` | `3C 9C 9D 89 09 40 B0 19` | Soft version / secret key (V1) |
-| 3 | `33` | `B5` | `6A A1 BB A7 01 FC` | Hard/wifi version write |
+| 3 | `33` | `B5` | `<unix_ts BE×4> 01 <tz_h i8> <tz_m>` | SyncTime (`SyncTimeController`); e.g. `6A A1 BB A7 01 FC 00` = UTC-4 |
 | 4 | `AA` | `B0` | none | Plug state query A |
 | 5 | `AA` | `B0` | `00 01` | Plug state query B |
 | 6 | `AA` | `12` | none | Timer count query |
@@ -152,7 +167,7 @@ The init sequence differs between firmware variants:
 | Order | Cmd | Sub | Data | Description |
 |-------|-----|-----|------|-------------|
 | 1 | `33` | `B2` | `[8-byte secret key]` | Write per-device secret key |
-| 2 | `33` | `B5` | `6A A4 8B 3F 01 FC` | Hard/wifi version write |
+| 2 | `33` | `B5` | `<unix_ts BE×4> 01 <tz_h i8> <tz_m>` | SyncTime |
 | 3 | `AA` | `EF` | none | Initial handshake |
 | 4 | `AA` | `B0` | none | Plug state query A |
 | 5 | `AA` | `B0` | `00 01` | Plug state query B |
@@ -192,32 +207,34 @@ sequence after the E7 handshake. This is the **complete protocol for replacing
 the Govee app** with our own pairing logic.
 
 ```
-Phase 1: Challenge reads (may be a "warmup" to unlock the plug)
-  AA B1 × 47+   (read secret key challenge, interleaved with AA 01 status)
+Phase 1: Poll for key until the user short-presses the plug button
+  AA B1 → AA B1 00 <random>   (×46, every ~240 ms)
+  AA B1 → AA B1 01 <8B key>   (button pressed)
 
-Phase 2: Write secret key
-  33 B2 <8-byte key>   (write/verify the secret key)
+Phase 2: Check key
+  33 B2 <8B key> → 33 B2 00
 
-Phase 3: Device info queries
-  AA 06         (manufacturer info query)
-  AA 07 03      (manufacturer info variant)
-  AA 21         (unknown - seen in pairing)
-  AA 20         (unknown - seen in pairing)
-  AA 14         (unknown - seen in pairing)
-  AA B3         (unknown - seen in pairing)
-  AA 07 02      (manufacturer info variant)
+Phase 3: Device info (decoded from 2026-09-16 capture, E245)   [BLE-only: optional]
+  AA 06    → "1.00.28" ASCII         firmware version
+  AA 07 03 → 03 "1.02.00"            hardware version
+  AA 21    → "1.00.28"               (fw version again)
+  AA 20    → "1.02.00"               (hw version again)
+  AA 14    → D4 AD FC 42 E2 44       WiFi MAC (= BLE MAC − 1)
+  AA B3    → 00
+  AA 07 02 → 02 44 E2 42 FC AD D4 47 D0   (reversed BLE MAC + 2 bytes)
 
-Phase 4: Pair confirm
-  AB 01 04      (pairing confirmation - commits the key)
+Phase 4: IoT credential fetch                                  [BLE-only: NOT needed]
+  AB 01 04 → multi-frame AB 00..05 response carrying an ASCII token
+             ("1789569723696fbd7855c6b1…") — cloud/IoT provisioning data
 
-Phase 5: WiFi provisioning (on handle 0x0025, not needed for BLE-only)
-  ...20-byte data frames...
+Phase 5: WiFi provisioning (handle 0x0025)                     [BLE-only: NOT needed]
 ```
 
-**Note**: The `33 B2` appears to be a **verify** operation — the plug checks
-the key against its stored value. Writing a different key than what the plug
-expects is silently rejected (toggle commands won't work). The mechanism for
-SETTING a new key (factory reset or pairing mode) is not yet understood.
+**Note**: `33 B2` is a **check**, never a set. The plug owns the key and
+reveals it via `AA B1` only after a physical button press. There is no need to
+factory-reset or to "set" a key. Pairing mode (hold button until the LED slowly
+blinks blue) is what the app's guide asks for before it scans; whether the
+`AA B1 01` unlock also works outside pairing mode is untested.
 
 ## Usage
 
@@ -258,7 +275,8 @@ sudo govee-ble on --mac D4:AD:FC:42:E2:45 --skey f6e0730a5be545e3
 sudo govee-ble off --mac D4:AD:FC:42:E2:45 --skey f6e0730a5be545e3
 
 # Read secret key from plug
-govee-ble get-skey --mac D4:AD:FC:41:E1:DD
+# Pair a plug without the Govee app (short-press the plug button when prompted)
+sudo govee-ble pair --mac D4:AD:FC:41:E1:DD
 ```
 
 ## Secret Keys (Captured)
@@ -287,7 +305,7 @@ govee-ble get-skey --mac D4:AD:FC:41:E1:DD
 |--------|---------|
 | `h5080_controller.py` | Working BLE controller (handshake + init + toggle) |
 | `govee-ble/src/main.rs` | Rust rewrite — single binary, no Python deps |
-| `scripts/get_skey.py` | Python script to extract secret key from plug |
+| `scripts/decode_sessions.py` | Decrypt every write+notify in a btsnoop, grouped by session with peer MAC |
 | `scripts/govee_ble_protocol.py` | Crypto library and key definitions |
 | `scripts/parse_btsnoop.py` | BTSnoop → ATT write extraction |
 

@@ -9,6 +9,7 @@ use std::time::Duration;
 use tokio::time::sleep;
 
 const KEY_COMM: &[u8; 16] = b"MakingLifeSmarte";
+const TZ_HOURS: i8 = -4; // sent in 33 B5 SyncTime; only affects on-device timers
 const PLUG_MAC: &str = "60:74:F4:BD:4D:E5";
 const SENSOR_MAC: &str = "E3:32:81:12:40:A4";
 
@@ -154,7 +155,11 @@ async fn init_plug(per: &btleplug::platform::Peripheral, sk: &[u8; 16], skey: Op
     }
     write_ctrl(per, &encrypt(&frame_from(0xAA, 0xEF, &[]), sk)).await?;
     sleep(Duration::from_millis(200)).await;
-    write_ctrl(per, &encrypt(&frame_from(0x33, 0xB5, &[0x6A,0xA1,0xBB,0xA7,0x01,0xFC]), sk)).await?;
+    // 33 B5 = SyncTime: [unix_ts BE x4][01][tz_hours i8][tz_min]
+    let ts = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map(|d| d.as_secs() as u32).unwrap_or(0);
+    let mut t = ts.to_be_bytes().to_vec();
+    t.extend_from_slice(&[0x01, TZ_HOURS as u8, 0x00]);
+    write_ctrl(per, &encrypt(&frame_from(0x33, 0xB5, &t), sk)).await?;
     sleep(Duration::from_millis(200)).await;
     write_ctrl(per, &encrypt(&frame_from(0xAA, 0xB0, &[]), sk)).await?;
     write_ctrl(per, &encrypt(&frame_from(0xAA, 0xB0, &[0x00,0x01]), sk)).await?;
@@ -244,8 +249,27 @@ async fn plug_status(plug_mac: &str, skey: Option<&[u8; 8]>) -> Result<bool, Str
     Err(format!("plug_status failed: {err}"))
 }
 
-// ========================= SECRET KEY EXTRACTION =========================
-async fn get_skey(plug_mac: &str) -> Result<String, String> {
+// ========================= PAIRING =========================
+// Wait up to `secs` for a decrypted frame matching cmd/sub.
+type NotifStream = std::pin::Pin<Box<dyn futures::Stream<Item = btleplug::api::ValueNotification> + Send>>;
+async fn wait_frame(s: &mut NotifStream, sk: &[u8; 16], cmd: u8, sub: u8, secs: u64) -> Option<[u8; 20]> {
+    let d = tokio::time::Instant::now() + Duration::from_secs(secs);
+    while tokio::time::Instant::now() < d {
+        if let Ok(Some(v)) = tokio::time::timeout(Duration::from_millis(200), s.next()).await {
+            let mut buf = [0u8; 20];
+            let l = v.value.len().min(20);
+            buf[..l].copy_from_slice(&v.value[..l]);
+            let dec = decrypt(&buf, sk);
+            if dec[0] == cmd && dec[1] == sub && verify(&dec) { return Some(dec); }
+        }
+    }
+    None
+}
+
+// App-free pairing, mirrors Govee's AbsPairAc4SecretV1:
+//   poll AA B1 until plug answers `AA B1 01 <8B key>` (user short-presses plug button),
+//   then 33 B2 <key> must answer `33 B2 00`. Key is plug-owned and persistent.
+async fn pair(plug_mac: &str, timeout_s: u64) -> Result<String, String> {
     let c = adapter().await;
     let per = find_mac(&c, plug_mac, 10).await?;
     per.connect().await.map_err(|e| format!("conn: {e}"))?;
@@ -253,34 +277,31 @@ async fn get_skey(plug_mac: &str) -> Result<String, String> {
     per.discover_services().await.map_err(|e| format!("disc svc: {e}"))?;
     sub_notify(&per).await?;
     let sk = handshake(&per).await?;
-    
-    // Send AA B1 to read secret key
-    write_ctrl(&per, &encrypt(&frame_from(0xAA, 0xB1, &[]), &sk)).await?;
-    
-    let mut s = per.notifications().await.map_err(|e| format!("notif: {e}"))?;
-    let deadline = tokio::time::Instant::now() + Duration::from_secs(3);
-    while tokio::time::Instant::now() < deadline {
-        let n = tokio::time::timeout(Duration::from_millis(500), s.next()).await.ok().and_then(|x| x);
-        if let Some(v) = n {
-            let mut buf = [0u8; 20];
-            let l = v.value.len().min(20);
-            buf[..l].copy_from_slice(&v.value[..l]);
-            let dec = decrypt(&buf, &sk);
-            if dec[0] == 0xAA && dec[1] == 0xB1 && verify(&dec) {
-                // Extract non-zero bytes (the secret key)
-                let key_bytes = &dec[2..19];
-                let nz: Vec<u8> = key_bytes.iter().copied().filter(|&b| b != 0).collect();
-                if !nz.is_empty() {
-                    per.disconnect().await.ok();
-                    drop(c);
-                    return Ok(hex::encode(&nz));
-                }
+    let mut s: NotifStream = per.notifications().await.map_err(|e| format!("notif: {e}"))?;
+    eprintln!("connected. >>> SHORT-PRESS the button on the plug now <<< (waiting {timeout_s}s)");
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(timeout_s);
+    let mut key = None;
+    while key.is_none() && tokio::time::Instant::now() < deadline {
+        write_ctrl(&per, &encrypt(&frame_from(0xAA, 0xB1, &[]), &sk)).await?;
+        if let Some(f) = wait_frame(&mut s, &sk, 0xAA, 0xB1, 1).await {
+            if f[2] == 0x01 { let mut k = [0u8; 8]; k.copy_from_slice(&f[3..11]); key = Some(k); }
+        }
+        sleep(Duration::from_millis(250)).await;
+    }
+    let r = match key {
+        None => Err("timed out: plug never confirmed (button not pressed?)".into()),
+        Some(k) => {
+            write_ctrl(&per, &encrypt(&frame_from(0x33, 0xB2, &k), &sk)).await?;
+            match wait_frame(&mut s, &sk, 0x33, 0xB2, 2).await {
+                Some(f) if f[2] == 0x00 => Ok(hex::encode(k)),
+                Some(f) => Err(format!("33 B2 rejected key (status {:02x})", f[2])),
+                None => Err("no 33 B2 response".into()),
             }
         }
-    }
+    };
     per.disconnect().await.ok();
     drop(c);
-    Err("no secret key response (V1 firmware?)".into())
+    r
 }
 
 // ========================= H5179 =========================
@@ -378,11 +399,11 @@ fn parse_skey(args: &[String], name: &str) -> Option<[u8; 8]> {
 async fn main() {
     let args: Vec<String> = std::env::args().collect();
     if args.len() < 2 {
-        eprintln!("Usage: govee-ble <read|on|off|status|scan|get-skey|daemon>");
+        eprintln!("Usage: govee-ble <read|on|off|status|scan|pair|daemon>");
         eprintln!("  read:   [--mac <addr>]");
         eprintln!("  on/off/status: [--mac <addr>] [--skey <hex8>]");
         eprintln!("  scan:   (no args, lists all nearby BLE devices 10s)");
-        eprintln!("  get-skey: --mac <addr> (reads secret key from plug)");
+        eprintln!("  pair:   --mac <addr> [--timeout SEC]  (prints secret key; short-press plug button when asked)");
         eprintln!("  daemon: [--interval SEC] [--threshold PCT] [--hc-url URL]");
         eprintln!("          [--plug-mac <addr>] [--sensor-mac <addr>] [--plug-skey <hex8>]");
         eprintln!("  Default plug MAC: {PLUG_MAC}");
@@ -430,11 +451,12 @@ async fn main() {
             }
             c.stop_scan().await.ok();
         },
-        "get-skey" => {
+        "pair" | "get-skey" => {
             let mac = &get_mac(&args, "--mac", "");
             if mac.is_empty() { eprintln!("--mac <addr> required"); std::process::exit(1); }
-            match get_skey(mac).await {
-                Ok(key) => println!("{}", key),
+            let t = get_arg(&args, "--timeout").and_then(|v| v.parse().ok()).unwrap_or(60);
+            match pair(mac, t).await {
+                Ok(key) => { eprintln!("paired. use: --skey {key}"); println!("{key}"); }
                 Err(e) => { eprintln!("{e}"); std::process::exit(1); }
             }
         },
