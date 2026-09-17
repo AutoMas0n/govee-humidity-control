@@ -35,19 +35,35 @@ AA B1            -> AA B1 01 <8-byte KEY>        real key, persistent per plug
   the key survives re-pairing. No generation, no reset, no cloud.
 - The old `get-skey` reported the random bytes from `AA B1 00` because it
   ignored the flag byte. That's the whole "dynamic challenge" red herring.
-- App UI string during this phase: `plug_single_pair_press_hint` =
+- App UI string during the confirm phase: `plug_single_pair_press_hint` =
   *"The device's power indicator is slowly flashing blue. Please short press its
-  switch button to pair."* Pairing-mode entry string: `plugv1_guide_des_v1` =
-  *"Press and hold the button until the indicator light slowly blinks blue."*
-- **Pairing mode is a prerequisite (confirmed by the plug owner + APK).** The
+  switch button to pair."* (`plugv1_guide_des_v1` — *"Press and hold the
+  button until the indicator light slowly blinks blue"* — is the app's
+generic guide; for a *bound* plug the actual re-entry trigger is the cloud
+unbind below, not the button hold.)
+- **Pairing mode is a prerequisite (plug-owner report + APK + captures).** The
   plug must already be in pairing mode (LED slowly blinking blue) before the
-  short-press confirms. There is **no BLE command that enters pairing mode** —
-  no such controller exists in the decompiled H5080 module, and the captures
-  show the app sends nothing before polling `AA B1`. The app merely drives the
-  flow; the plug enters pairing mode itself and the button-press confirms. In
-  `pair`, output token `00` = plug IS in pairing mode (awaiting press),
-  `-` = plug not answering (not in pairing mode — hold its button until LED
-  slowly blinks blue; that's why the E1DD run timed out).
+  short-press confirms `AA B1 01`.
+- **How pairing mode actually starts (corrected):** the Govee app's "forget
+  device" is a **cloud unbind**, not a BLE request: `deleteDevice` →
+  `netService4Base.deleteDevice(Request4DeleteDevice)` (a network call,
+  response `UnBindDeviceFeastInfo`). The H5080 is WiFi+BLE; it holds a cloud
+  IoT session (`AB 01 04` token fetch we captured). When the account unbinds
+  it, the plug learns over **WiFi** that it's unbound and enters pairing mode
+  on its own (flashing blue). That's why "forget → add new → plug flashes":
+  the app made a cloud unbind; the plug decided to become pairable. A fresh
+  out-of-box plug is already pairable.
+- **There is no BLE "enter pairing mode" command.** The H5080 controller set
+  (Switch/Timer/SyncTime/Version/Spec/Heart + `SecretKeyController(V1)`
+  read/check) has none, and no capture shows any frame before the `AA B1`
+  polls — only the handshake + `AA 01`. So btsnoop (Bluetooth-only) can't see
+  the trigger because the trigger is the cloud unbind over WiFi.
+- **Consequence for `govee-ble pair`:** it cannot make a bound plug pairable —
+  that action is cloud-side. It can only detect the state: token `00` = plug
+  IS in pairing mode (awaiting press), `-` = not in pairing mode (or out of
+  range). Re-pairing a bound plug locally therefore isn't possible; you can
+  either read the key during the app's initial pairing (as our captures did)
+  or use a fresh/unbound plug.
 - `AB 01 04` + `AA 06/07/14/20/21/B3` after the key check are firmware/hw
   version, WiFi MAC and an IoT credential token — cloud provisioning, **not
   needed** for BLE control.
@@ -71,6 +87,13 @@ blue). If not: HOLD the plug button until the LED slowly blinks blue. Then
 SHORT-PRESS the button on the plug now <<<` and then one token per poll:
 `00` = plug IS in pairing mode (not yet confirmed), `-` = no reply (plug not
 in pairing mode or out of range).
+
+**Reality check:** the app's "forget device → add new device" puts a *bound*
+plug into pairing mode via a **cloud unbind over the plug's WiFi link** — not
+over BLE. `govee-ble pair` cannot imitate that (no BLE command exists for it,
+and unbinding would require Govee cloud access). `pair` is therefore only for
+adding a *currently pairable* plug (fresh out-of-box, or one you've rebound
+via the app).
 
 1. **Put the plug in pairing mode first** (hold its button until the LED
    slowly blinks blue), then short-press the button once.
@@ -205,13 +228,13 @@ Developer Options → Bug report → Interactive. jadx 1.5.5 installed in Termux
 ## Open Items
 
 1. **E1DD's key is captured** (`a69f370afd964e0d`, `btsnoop_new` sess. 22–23,
-   `33 B2` accepted). Sub-question **answered by the plug owner**: pairing mode
-   IS required — the app drives the flow and the plug must be in pairing mode
-   (LED slowly blinking blue, entered when it was re-paired; on a fresh plug
-   the user holds the button until the LED blinks blue) before the short-press
-   confirms. There is no BLE command to enter pairing mode, so `pair` can't
-   initiate it — only the person at the plug can. `pair` on E1DD should return
-   `a69f370afd964e0d` (put E1DD in pairing mode first).
+   `33 B2` accepted). Mechanism **resolved**: pairing mode is required before
+   the short-press confirms, and a *bound* plug only re-enters pairing mode via
+   the Govee app's "forget device" (cloud unbind over the plug's WiFi link —
+   there is no BLE command for it). `pair` works only on a plug that is
+   *already* pairable (fresh out-of-box, or one just rebooted in the app). To
+   re-read E1DD's key: unbind it in the app first, then `pair` — expected
+   `a69f370afd964e0d`.
 2. Re-verify 4DE5 toggles: captures show it answering `33 B2 3c9c9d890940b019`
    with `33 B2 00` in every session (incl. 09-16 20:26 sess. 20/24/25/26); a
    live toggle confirms end to end.

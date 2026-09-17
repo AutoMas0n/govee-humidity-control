@@ -132,17 +132,23 @@ Resp:  AA B1 <flag> [8 bytes] [padding] [XOR]
 ```
 
 The plug answers `00 <random>` until the user **short-presses the plug's
-button**, then answers `01 <key>`. **Pairing mode is required first**: the app
-UI asks the user to hold the plug button until the indicator slowly blinks
-blue (`plugv1_guide_des_v1`), and only then short-press to confirm
-(`plug_single_pair_press_hint`). There is **no BLE command that enters pairing
-mode** — no such controller exists in the decompiled H5080 module and no such
-frame appears in any capture; the plug enters this state on its own and the
-app only polls. While polling, `AA B1 00` means "in pairing mode, awaiting the
-press" and no reply means the plug is not in pairing mode (or out of range).
-Verified in the 2026-09-16 capture: 46× `AA B1 00 …`, then
-`AA B1 01 f6e0730a5be545e3` right after the press, once the plug was in
-pairing mode.
+button**, then answers `01 <key>`. **Pairing mode is required first**: the
+plug must already be in pairing mode (its indicator slowly blinking blue)
+before the short-press confirms. How a plug gets into pairing mode:
+- A **fresh out-of-box plug** is already pairable.
+- A **bound plug** only re-enters pairing mode after the Govee app's "forget
+  device", which is a **cloud unbind** (`deleteDevice` →
+  `netService4Base.deleteDevice(...)`, response `UnBindDeviceFeastInfo`); the
+  plug learns over its WiFi IoT link that it is unbound and starts flashing
+  on its own.
+There is **no BLE command that enters pairing mode** — the H5080 controller
+set has none, and no capture shows any frame before the `AA B1` polling begins
+(only the E7 handshake + `AA 01`). The btsnoop can't see the trigger because
+the trigger is cloud-over-WiFi, not Bluetooth. While polling, `AA B1 00` means
+"in pairing mode, awaiting the press" and no reply means the plug is not in
+pairing mode (or out of range). Verified in the 2026-09-16 capture: 46×
+`AA B1 00 …`, then `AA B1 01 f6e0730a5be545e3` right after the press, once
+the plug was in pairing mode.
 
 ### Checking the Secret Key (33 B2)
 
@@ -248,9 +254,11 @@ Phase 5: WiFi provisioning (handle 0x0025)                     [BLE-only: NOT ne
 
 **Note**: `33 B2` is a **check**, never a set. The plug owns the key and
 reveals it via `AA B1` only after a physical button press while in **pairing
-mode** (plug LED slowly blinking blue; entered by holding the plug's button —
-there is no BLE command for this, the app just drives the flow). A short-press
-in normal mode does not confirm. No factory-reset or "set" is needed.
+mode** (plug LED slowly blinking blue). A bound plug only re-enters pairing
+mode via the Govee app's "forget device" = **cloud unbind over the plug's
+WiFi link** — there is no BLE command for it, and the app never sends one.
+A short-press in normal mode does not confirm. A fresh out-of-box plug is
+already pairable. No factory-reset or "set" is needed.
 
 ## Usage
 
@@ -332,12 +340,12 @@ sudo govee-ble pair --mac D4:AD:FC:41:E1:DD
    - Need a genuinely factory-fresh plug or known reset procedure
 
 2. **Is pairing mode required before the button-press confirms?**
-   **Yes** (per plug owner + app UI + capture evidence): the plug must be in
-   pairing mode (LED slowly blinking blue) before the short-press reveals the
-   key via `AA B1 01`. Normal-mode short-press does not suffice. There is no
+   **Yes** (per plug owner + capture evidence): the plug must be in pairing
+   mode (LED slowly blinking blue) before the short-press reveals the key via
+   `AA B1 01`. A bound plug re-enters pairing mode when the app un-forgets it
+   (cloud unbind over WiFi); a fresh plug is already pairable. There is no
    BLE command that enters pairing mode, so `govee-ble pair` cannot initiate
-   it — the person at the plug must hold the button until the LED blinks blue
-   first, then short-press.
+   it — it can only read the key from a plug already in pairing mode.
 
 3. **What resets the H5080 to factory state?**
    - Long press (10s+) the physical button?
