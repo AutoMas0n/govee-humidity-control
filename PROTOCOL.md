@@ -15,6 +15,14 @@ Complete reverse-engineered BLE protocol for the Govee H5080 smart plug
 | MTU | 20-byte payloads (matches BLE minimum) |
 | Encryption | AES-128-ECB (first 16B) + RC4 (last 4B) |
 
+**Verification status (2026-09-17):** every frame on the command
+characteristic (write h0011 / notify h000e) in all three captures decodes
+with a valid XOR checksum — 3 plugs, 36 sessions in `btsnoop_new`. Frames on
+other handles (h0022/h0025 = WiFi provisioning, etc.) are NOT session-
+encrypted and correctly fail checksum; they are unrelated to BLE switching.
+The AES-ECB+RC4 layer and the `33 01 11`/`33 01 10` toggle bytes are thereby
+confirmed against real traffic, not just APK analysis.
+
 ## Protocol Overview
 
 Every interaction is **20-byte frames** encrypted with AES-128-ECB + RC4:
@@ -184,7 +192,7 @@ cycle also sends `AA 01` (status query) between init steps.
 | 1 | `0x01` | Sub-command: toggle |
 | 2 | `0x11` | ON |
 | 3..18 | `0x00` | Padding |
-| 19 | `0x23` | Checksum (or calculated) |
+| 19 | `0x23` | Checksum (**XOR of bytes 0..18**: `33^01^11 = 0x23`, verified against live capture — not a placeholder) |
 
 Device responds with NOTIFY: `33 01 00 00 ... [checksum]`
 
@@ -196,7 +204,7 @@ Device responds with NOTIFY: `33 01 00 00 ... [checksum]`
 | 1 | `0x01` | Sub-command: toggle |
 | 2 | `0x10` | OFF |
 | 3..18 | `0x00` | Padding |
-| 19 | `0x22` | Checksum (or calculated) |
+| 19 | `0x22` | Checksum (**XOR of bytes 0..18**: `33^01^10 = 0x22`, verified against live capture — not a placeholder) |
 
 Device responds with NOTIFY: `33 01 00 00 ... [checksum]`
 
@@ -314,22 +322,30 @@ sudo govee-ble pair --mac D4:AD:FC:41:E1:DD
 1. **Can `33 B2` SET a new key on a factory-reset plug?**
    - Not proven — our plugs were all already paired
    - Need a genuinely factory-fresh plug or known reset procedure
-   
-2. **How does the app generate secret keys?**
-   - `SecretKeyController` class is in a compiled library (not decompiled)
-   - Found in `classes2.dex`, `classes3.dex`, `classes4.dex`, `classes10.dex`
-   
-3. **Can we extract stored keys from the phone without root?**
-   - Try: `adb backup -f backup.ab com.govee.home` (needs phone confirmation)
-   - Then: `(printf "\\x1f\\x8b\\x08\\x00\\x00\\x00\\x00\\x00"; tail -c +25 backup.ab) | gunzip | tar xvf -`
-   
-4. **What resets the H5080 to factory state?**
+
+2. **Does normal-mode short-press suffice, or is pairing mode required?**
+   - The user must press the plug button to reveal the key via `AA B1 01`.
+     Untested live (E1DD sessions 22–23 show the app already holding the key,
+     so they don't capture a reveal). `pair` on a plug answers this.
+
+3. **What resets the H5080 to factory state?**
    - Long press (10s+) the physical button?
    - Power cycle pattern?
-   
-5. **Does `AB 01 04` commit the secret key?**
-   - Seen after 33 B2 in the pairing capture
-   - Might finalize the pairing and save the key permanently
+
+## Resolved (2026-09-17)
+
+- ~~Can the key be SET via `33 B2`?~~ No — it's a check. Confirmed again in
+  `btsnoop_new`: every session sends `33 B2 <known key>` and the plug answers
+  `33 B2 00`. No SET path needed.
+- ~~Is AES-ECB+RC4 real, or just a doc artifact?~~ Real. See verification note
+  above: 100% of command-channel frames pass the XOR checksum after decrypt.
+- ~~Is the toggle byte `11`/`10` right?~~ Yes — live captures show
+  `33 01 11` (ON) / `33 01 10` (OFF) on E245 and 4DE5. Public egold555 docs
+  show `ff`/`f0`, but our captures override on this hardware.
+- ~~Does `AB 01 04` commit the secret key?~~ No — it fetches an IoT token
+  (cloud provisioning, not needed for BLE).
+- ~~Are keys stored in phone / extractable?~~ Unnecessary — `pair` reads them
+  from the plug (see HANDOVER).
 
 See `HANDOVER.md` for full context and next steps.
 - `h5080-ble-alternative` — Hybrid cloud approach (rejected)

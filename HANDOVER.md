@@ -89,9 +89,12 @@ Sanity check that pairing works at all: run the same against E245
 
 All plugs advertise as `ihoment_H5080_XXXX`, manufacturer id `0x8843`.
 
-**Important:** the 09-16 bugreport labelled "E1DD re-pairing" contains **zero
-E1DD sessions** (14× E245, 2× 4DE5). E1DD's key has never been observed.
-Nothing about E1DD is broken; it just needs `pair`.
+**Important (capture chronology):** there are **two** 09-16 bugreports. The
+older one (`btsnoop_0916`, 10:46, 16 sessions) contains **zero E1DD sessions**
+(only E245 + 4DE5) — it predates the E1DD re-pair. The newer one
+(`btsnoop_new`, 20:26, **36 sessions**) contains E1DD: sessions 22–23 connect
+to `D4:AD:FC:41:E1:DD` and send `33 B2 a69f370afd964e0d` (accepted → `33 B2 00`).
+That is where the E1DD key in the table above came from.
 
 ---
 
@@ -166,7 +169,8 @@ ssh pi@192.168.2.21 'export PATH=$HOME/.cargo/bin:$PATH; cd ~/Github/govee-humid
 | `~/govee_apk/h5080/classes/sources/com/govee/h5080/` | jadx-decompiled H5080 module (`add/AbsPairAc4SecretV1.java` = pairing state machine, `ble/controller/SyncTimeController.java`, …) |
 | `~/govee_apk/skc/` | `SecretKeyController.java`, `EventSecretKey.java`, `AbsSingleController.java` etc. — extracted with `jadx --single-class com.govee.base2light.ble.controller.SecretKeyController base/classes10.dex` |
 | `~/govee_apk/base_full/resources/res/values/strings.xml` | UI strings (`plug_*_press_hint`) |
-| `~/btsnoop_0916/btsnoop_hci.log` | 09-16 capture (E245 re-pair, contains the `AA B1 01` proof) |
+| `~/btsnoop_0916/btsnoop_hci.log` | 09-16 10:46 capture — 16 sessions, **no E1DD** (E245 + 4DE5 only); contains the `AA B1 01 f6e0730a5be545e3` proof (sess. 13) |
+| `~/btsnoop_new/btsnoop_hci.log` | 09-16 20:26 capture — **36 sessions, incl. E1DD 22–23** (`33 B2 a69f370afd964e0d` accepted); also `AA B1 01` reveals for 4DE5 (`3c9c9d890940b019`) |
 | `~/btsnoop_e1dd/btsnoop_hci.log` | 09-15 capture (E245 toggles despite the dir name) |
 | `~/bugreport*.zip`, `/storage/emulated/0/Download/bugreport-*.zip` | raw bugreports; btsnoop at `FS/data/misc/bluetooth/logs/btsnoop_hci.log` |
 
@@ -176,7 +180,8 @@ ssh pi@192.168.2.21 'export PATH=$HOME/.cargo/bin:$PATH; cd ~/Github/govee-humid
 
 **Raspberry Pi** — `pi@192.168.2.21`, Debian 12 armv7l, kernel 6.1, CYW43455 BLE.
 Repo `~/Github/govee-humidity-control/`, binary `govee-ble/target/release/govee-ble`
-(needs `sudo`). Rust via rustup (`~/.cargo/bin`). systemd unit **not yet created**.
+(needs `sudo`). Rust via rustup (`~/.cargo/bin`). systemd unit:
+`govee-ble/humidity-daemon.service` (copy to `/etc/systemd/system/` + `enable --now`).
 
 **Android** — Motorola g86 power 5G, Termux. ADB wireless (port rotates).
 btsnoop: `adb shell settings put global bluetooth_hci_snoop_log 1`, then
@@ -186,10 +191,18 @@ Developer Options → Bug report → Interactive. jadx 1.5.5 installed in Termux
 
 ## Open Items
 
-1. **Run `pair` on E1DD** with someone at the plug (see NEXT ACTION).
-   Determine whether normal-mode short-press suffices or pairing mode is needed.
-2. Re-verify 4DE5 toggles (it's back in scan results).
-3. systemd unit for `daemon` (E245 = dehumidifier, sensor 40A4).
+1. **E1DD's key is captured** (`a69f370afd964e0d`, `btsnoop_new` sess. 22–23,
+   `33 B2` accepted). The one open sub-question is *how the key was revealed to
+   the app*: those sessions show the app already holding the key (direct
+   `33 B2`, no `AA B1` polling), so whether **normal-mode short-press** suffices
+   or **pairing mode** is required is still untested live. Run `pair` on E1DD
+   at the plug to answer it — expected to return `a69f370afd964e0d`.
+2. Re-verify 4DE5 toggles: captures show it answering `33 B2 3c9c9d890940b019`
+   with `33 B2 00` in every session (incl. 09-16 20:26 sess. 20/24/25/26); a
+   live toggle confirms end to end.
+3. systemd unit for `daemon` — **added** as `govee-ble/humidity-daemon.service`
+   (E245 = dehumidifier, sensor 40A4). Install: `sudo cp` to
+   `/etc/systemd/system/`, `daemon-reload`, `enable --now`.
 4. Optional cleanup: drop the older one-off scripts now that `decode_sessions.py` supersedes them.
 5. Optional: `pair` could persist keys to a config file instead of requiring `--skey` on every call.
 
@@ -224,6 +237,10 @@ sudo ./target/release/govee-ble off --mac D4:AD:FC:42:E2:45 --skey f6e0730a5be54
 sudo ./target/release/govee-ble read --mac E3:32:81:12:40:A4
 sudo ./target/release/govee-ble daemon --plug-mac D4:AD:FC:42:E2:45 --plug-skey f6e0730a5be545e3 \
   --sensor-mac E3:32:81:12:40:A4 --interval 60 --threshold 60 --hc-url http://your-id.healthchecks.io
+
+# run it as a service (edit the --hc-url line in the unit first):
+sudo cp govee-ble/humidity-daemon.service /etc/systemd/system/
+sudo systemctl daemon-reload && sudo systemctl enable --now humidity-daemon
 ```
 
 ## Contact

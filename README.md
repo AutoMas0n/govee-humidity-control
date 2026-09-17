@@ -1,123 +1,84 @@
-# Python
-python3 -m venv venv
-source venv/bin/activate
-pip install --upgrade pip
-touch main.py
-pip freeze > requirements.txt
+# Govee Humidity Control
 
-# Rust
+Local, cloud-free control of Govee smart-home devices over Bluetooth LE.
 
-### Prerequisites
-1. **Rust and Cargo Installation on Desktop**:
-   Ensure you have Rust installed on your desktop. If not, you can install it using the following command:
-   ```sh
-   curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh
-   source $HOME/.cargo/env
-   ```
+- **H5080 smart plug** (`ihoment_H5080`) — ON/OFF switching
+- **H5179 humidity sensor** — temperature/humidity/battery
 
-2. **Install Dependencies**:
-   Ensure you have the necessary dependencies for cross-compilation:
-   ```sh
-   sudo apt-get update
-   sudo apt-get install gcc-arm-linux-gnueabihf
-   ```
+Zero cloud dependency. Runs on a Raspberry Pi 4 (Debian 12, armv7l), or any
+BLE-capable Linux. No Govee account, no API key, no internet required.
 
-### Steps to Cross-Compile for Raspberry Pi
-1. **Add ARM Target**:
-   Add the ARM target to your Rust toolchain:
-   ```sh
-   rustup target add armv7-unknown-linux-gnueabihf
-   ```
+Full protocol details: [`PROTOCOL.md`](PROTOCOL.md), operations doc:
+[`HANDOVER.md`](HANDOVER.md).
 
-2. **Create a `.cargo` Directory**:
-   In the root of your Rust project, create a `.cargo` directory and add a `config` file with the following content:
-   ```toml
-   [target.armv7-unknown-linux-gnueabihf]
-   linker = "arm-linux-gnueabihf-gcc"
-   ```
+## Usage
 
-3. you might need a manual installation of OpenSSL:
-   ```sh
-   wget https://www.openssl.org/source/openssl-1.1.1.tar.gz
-   tar -xf openssl-1.1.1.tar.gz
-   cd openssl-1.1.1
-   ./config --prefix=/usr/local/ssl --openssldir=/usr/local/ssl shared zlib
-   make
-   sudo make install
-   export OPENSSL_DIR=/usr/local/ssl
-   ```
+The Rust binary lives in `govee-ble/` (single-file `src/main.rs`, build on the
+Pi — btleplug can't cross-compile from Termux/Android).
 
-4. **Build the Project for ARM**:
-   Build your project for the ARM architecture:
-   ```sh
-   export OPENSSL_DIR=/usr/local/ssl
-   export PKG_CONFIG_PATH=/usr/local/ssl/lib/pkgconfig
-   cargo build --release --target=armv7-unknown-linux-gnueabihf
-   ```
+```bash
+# on the Pi, in govee-ble/
+sudo ./target/release/govee-ble scan                     # discover devices
+sudo ./target/release/govee-ble status --mac ... --skey <hex8>
+sudo ./target/release/govee-ble on      --mac ... --skey <hex8>
+sudo ./target/release/govee-ble off     --mac ... --skey <hex8>
+sudo ./target/release/govee-ble pair    --mac ... --timeout 120   # app-free pairing
+sudo ./target/release/govee-ble read    --mac <sensor-mac>        # H5179
+```
 
-### Transfer the Binary to Raspberry Pi
-1. **Copy the Binary**:
-   Copy the compiled binary to your Raspberry Pi. You can use `scp` (secure copy) for this:
-   ```sh
-   scp target/armv7-unknown-linux-gnueabihf/release/humidity_checker pi@raspberrypi:/home/pi/humidity_checker
-   ```
+### Known devices
 
-2. **Copy the `api_key.secret` File**:
-   Ensure the `api_key.secret` file is also transferred to the Raspberry Pi:
-   ```sh
-   scp api_key.secret pi@raspberrypi:/home/pi/api_key.secret
-   ```
+| Device | MAC | Secret key |
+|--------|-----|------------|
+| H5080 plug E245 (dehumidifier) | `D4:AD:FC:42:E2:45` | `f6e0730a5be545e3` |
+| H5080 plug E1DD | `D4:AD:FC:41:E1:DD` | `a69f370afd964e0d` |
+| H5080 plug 4DE5 (V1 firmware) | `60:74:F4:BD:4D:E5` | none needed |
+| H5179 sensor | `E3:32:81:12:40:A4` | n/a |
 
-### Running the Application on Raspberry Pi
-1. **SSH into Raspberry Pi**:
-   SSH into your Raspberry Pi:
-   ```sh
-   ssh pi@raspberrypi
-   ```
+Newer H5080 firmware requires an 8-byte per-plug secret key (the plug owns
+it and reveals it via `AA B1` only after a physical button press) — get it
+with `govee-ble pair` or decode it from a btsnoop capture.
 
-2. **Install Required Libraries**:
-   Ensure you have the required libraries installed on your Raspberry Pi:
-   ```sh
-   sudo apt-get update
-   sudo apt-get install libssl-dev
-   ```
+## Humidity daemon
 
-3. **Run the Application**:
-   Run the transferred binary:
-   ```sh
-   ./humidity_checker
-   ```
+```bash
+sudo ./target/release/govee-ble daemon \
+  --plug-mac D4:AD:FC:42:E2:45 --plug-skey f6e0730a5be545e3 \
+  --sensor-mac E3:32:81:12:40:A4 \
+  --interval 60 --threshold 60 --hc-url http://your-id.healthchecks.io
+```
 
-### Optional: Running as a Background Service
-To ensure the program runs continuously, you might want to set it up as a systemd service:
+Reads the sensor every `--interval` seconds and switches the plug on when
+humidity exceeds `--threshold` % (off otherwise). Optionally pings a
+healthchecks.io URL on each cycle.
 
-1. **Create a Service File**:
-   On your Raspberry Pi, create a new service file, e.g., `humidity_checker.service`:
-   ```ini
-   [Unit]
-   Description=Humidity Checker Service
-   After=network.target
-   [Service]
-   ExecStart=/home/pi/humidity_checker
-   WorkingDirectory=/home/pi
-   StandardOutput=inherit
-   StandardError=inherit
-   Restart=always
-   User=pi
-   [Install]
-   WantedBy=multi-user.target
-   ```
+### systemd (auto-start on boot)
 
-2. **Move the Service File**:
-   ```sh
-   sudo mv humidity_checker.service /etc/systemd/system/
-   ```
+```bash
+# edit govee-ble/humidity-daemon.service first to set your --hc-url
+sudo cp govee-ble/humidity-daemon.service /etc/systemd/system/
+sudo systemctl daemon-reload
+sudo systemctl enable --now humidity-daemon
+```
 
-3. **Reload Systemd and Enable the Service**:
-   ```sh
-   sudo systemctl daemon-reload
-   sudo systemctl enable humidity_checker.service
-   sudo systemctl start humidity_checker.service
-   ```
+## Building on the Pi
 
-This setup will ensure your Rust application runs continuously and restarts automatically if it crashes or your Raspberry Pi reboots.
+```bash
+ssh pi@192.168.2.21 'export PATH=$HOME/.cargo/bin:$PATH; \
+  cd ~/Github/govee-humidity-control && git pull && cd govee-ble && \
+  cargo build --release'
+```
+
+(`/usr/bin/cargo` is too old for the lockfile; use rustup's).
+
+## Analysis scripts (Termux, optional)
+
+`scripts/decode_sessions.py <btsnoop_hci.log>` decrypts every write and
+notification in an Android BLE capture, grouped per E7 session, and validates
+each frame's XOR checksum — the ground truth the protocol docs are based on.
+
+## Repository history
+
+- Python cloud proof-of-concept (abandoned): `main.py`, `h5080_controller.py`
+- Rust rewrite with scan/on/off/status/read/pair/daemon subcommands:
+  `govee-ble/`
