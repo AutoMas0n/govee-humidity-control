@@ -285,7 +285,7 @@ sudo govee-ble pair --mac D4:AD:FC:41:E1:DD
 |----------|-----------|-------|
 | `60:74:F4:BD:4D:E5` | (none needed) | V1 firmware, BLE toggle works without key |
 | `D4:AD:FC:42:E2:45` | `f6e0730a5be545e3` | Extracted from btsnoop, verified working |
-| `D4:AD:FC:41:E1:DD` | (needs capture) | V2+ firmware, requires btsnoop to extract key |
+| `D4:AD:FC:41:E1:DD` | `a69f370afd964e0d` | Captured from 09-16 btsnoop, verified working |
 
 ## Discovery Story
 
