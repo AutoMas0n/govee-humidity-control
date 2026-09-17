@@ -267,8 +267,18 @@ async fn wait_frame(s: &mut NotifStream, sk: &[u8; 16], cmd: u8, sub: u8, secs: 
 }
 
 // App-free pairing, mirrors Govee's AbsPairAc4SecretV1:
-//   poll AA B1 until plug answers `AA B1 01 <8B key>` (user short-presses plug button),
-//   then 33 B2 <key> must answer `33 B2 00`. Key is plug-owned and persistent.
+//   1. The PLUG must already be in pairing mode (per the app: hold the plug's
+//      button until its indicator slowly blinks blue). There is NO BLE command
+//      that enters pairing mode — the app drives the pairing flow and the plug
+//      enters this state on its own. Verified: no "enter pairing mode" frame in
+//      any capture, and no such controller in the decompiled H5080 module.
+//   2. Poll AA B1 until plug answers `AA B1 01 <8B key>` — the user SHORT-
+//      PRESSES the plug button while it is in pairing mode (AA B1 00 = in
+//      pairing mode but not yet confirmed; no reply = plug in normal mode).
+//   3. 33 B2 <key> must answer `33 B2 00`. Key is plug-owned and persistent.
+// Output tokens: `00` = in pairing mode, awaiting button press; `-` = plug not
+// answering (not in pairing mode — hold its button until LED slowly blinks
+// blue), or out of range.
 async fn pair(plug_mac: &str, timeout_s: u64) -> Result<String, String> {
     let c = adapter().await;
     let per = find_mac(&c, plug_mac, 10).await?;
@@ -278,7 +288,9 @@ async fn pair(plug_mac: &str, timeout_s: u64) -> Result<String, String> {
     sub_notify(&per).await?;
     let sk = handshake(&per).await?;
     let mut s: NotifStream = per.notifications().await.map_err(|e| format!("notif: {e}"))?;
-    eprintln!("connected. >>> SHORT-PRESS the button on the plug now <<< (waiting {timeout_s}s)");
+    eprintln!("connected. The plug must be in pairing mode (LED slowly blinking blue).");
+    eprintln!("  If not: HOLD the plug button until the LED slowly blinks blue.");
+    eprintln!("  Then SHORT-PRESS the button on the plug now <<< (waiting {timeout_s}s)");
     let deadline = tokio::time::Instant::now() + Duration::from_secs(timeout_s);
     let mut key = None;
     while key.is_none() && tokio::time::Instant::now() < deadline {
@@ -405,7 +417,8 @@ async fn main() {
         eprintln!("  read:   [--mac <addr>]");
         eprintln!("  on/off/status: [--mac <addr>] [--skey <hex8>]");
         eprintln!("  scan:   (no args, lists all nearby BLE devices 10s)");
-        eprintln!("  pair:   --mac <addr> [--timeout SEC]  (prints secret key; short-press plug button when asked)");
+        eprintln!("  pair:   --mac <addr> [--timeout SEC]  (prints secret key; plug must be in pairing mode");
+        eprintln!("          first — hold its button until LED slowly blinks blue, then short-press it)");
         eprintln!("  daemon: [--interval SEC] [--threshold PCT] [--hc-url URL]");
         eprintln!("          [--plug-mac <addr>] [--sensor-mac <addr>] [--plug-skey <hex8>]");
         eprintln!("  Default plug MAC: {PLUG_MAC}");

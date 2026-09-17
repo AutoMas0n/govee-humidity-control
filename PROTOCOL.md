@@ -122,19 +122,27 @@ The app never generates it — it *reads* it from the plug once during pairing
 (`SecretKeyController`, `base2light/ble/controller`, classes10.dex) and stores
 it in `SecretKeyConfig`. No app or cloud is required to obtain it.
 
-### Reading the Secret Key (AA B1) — requires physical button press
+### Reading the Secret Key (AA B1) — requires pairing mode + physical button press
 
 ```
 Cmd:   AA B1 [padding] [XOR]
 Resp:  AA B1 <flag> [8 bytes] [padding] [XOR]
-         flag = 0x00 → not confirmed; the 8 bytes are RANDOM junk
+         flag = 0x00 → in pairing mode, not yet confirmed; the 8 bytes are RANDOM junk
          flag = 0x01 → the 8 bytes are the real secret key
 ```
 
 The plug answers `00 <random>` until the user **short-presses the plug's
-button**, then answers `01 <key>`. The app polls every ~250 ms with the UI text
-*"Please short press its switch button to pair"*. Verified in the 2026-09-16
-capture: 46× `AA B1 00 …`, then `AA B1 01 f6e0730a5be545e3` right after the press.
+button**, then answers `01 <key>`. **Pairing mode is required first**: the app
+UI asks the user to hold the plug button until the indicator slowly blinks
+blue (`plugv1_guide_des_v1`), and only then short-press to confirm
+(`plug_single_pair_press_hint`). There is **no BLE command that enters pairing
+mode** — no such controller exists in the decompiled H5080 module and no such
+frame appears in any capture; the plug enters this state on its own and the
+app only polls. While polling, `AA B1 00` means "in pairing mode, awaiting the
+press" and no reply means the plug is not in pairing mode (or out of range).
+Verified in the 2026-09-16 capture: 46× `AA B1 00 …`, then
+`AA B1 01 f6e0730a5be545e3` right after the press, once the plug was in
+pairing mode.
 
 ### Checking the Secret Key (33 B2)
 
@@ -239,10 +247,10 @@ Phase 5: WiFi provisioning (handle 0x0025)                     [BLE-only: NOT ne
 ```
 
 **Note**: `33 B2` is a **check**, never a set. The plug owns the key and
-reveals it via `AA B1` only after a physical button press. There is no need to
-factory-reset or to "set" a key. Pairing mode (hold button until the LED slowly
-blinks blue) is what the app's guide asks for before it scans; whether the
-`AA B1 01` unlock also works outside pairing mode is untested.
+reveals it via `AA B1` only after a physical button press while in **pairing
+mode** (plug LED slowly blinking blue; entered by holding the plug's button —
+there is no BLE command for this, the app just drives the flow). A short-press
+in normal mode does not confirm. No factory-reset or "set" is needed.
 
 ## Usage
 
@@ -323,10 +331,13 @@ sudo govee-ble pair --mac D4:AD:FC:41:E1:DD
    - Not proven — our plugs were all already paired
    - Need a genuinely factory-fresh plug or known reset procedure
 
-2. **Does normal-mode short-press suffice, or is pairing mode required?**
-   - The user must press the plug button to reveal the key via `AA B1 01`.
-     Untested live (E1DD sessions 22–23 show the app already holding the key,
-     so they don't capture a reveal). `pair` on a plug answers this.
+2. **Is pairing mode required before the button-press confirms?**
+   **Yes** (per plug owner + app UI + capture evidence): the plug must be in
+   pairing mode (LED slowly blinking blue) before the short-press reveals the
+   key via `AA B1 01`. Normal-mode short-press does not suffice. There is no
+   BLE command that enters pairing mode, so `govee-ble pair` cannot initiate
+   it — the person at the plug must hold the button until the LED blinks blue
+   first, then short-press.
 
 3. **What resets the H5080 to factory state?**
    - Long press (10s+) the physical button?

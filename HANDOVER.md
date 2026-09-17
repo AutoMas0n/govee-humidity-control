@@ -39,6 +39,15 @@ AA B1            -> AA B1 01 <8-byte KEY>        real key, persistent per plug
   *"The device's power indicator is slowly flashing blue. Please short press its
   switch button to pair."* Pairing-mode entry string: `plugv1_guide_des_v1` =
   *"Press and hold the button until the indicator light slowly blinks blue."*
+- **Pairing mode is a prerequisite (confirmed by the plug owner + APK).** The
+  plug must already be in pairing mode (LED slowly blinking blue) before the
+  short-press confirms. There is **no BLE command that enters pairing mode** —
+  no such controller exists in the decompiled H5080 module, and the captures
+  show the app sends nothing before polling `AA B1`. The app merely drives the
+  flow; the plug enters pairing mode itself and the button-press confirms. In
+  `pair`, output token `00` = plug IS in pairing mode (awaiting press),
+  `-` = plug not answering (not in pairing mode — hold its button until LED
+  slowly blinks blue; that's why the E1DD run timed out).
 - `AB 01 04` + `AA 06/07/14/20/21/B3` after the key check are firmware/hw
   version, WiFi MAC and an IoT credential token — cloud provisioning, **not
   needed** for BLE control.
@@ -57,12 +66,16 @@ cd ~/Github/govee-humidity-control/govee-ble
 sudo ./target/release/govee-ble pair --mac D4:AD:FC:41:E1:DD --timeout 120
 ```
 
-It prints `connected. >>> SHORT-PRESS the button on the plug now <<<` and then
-one token per poll: `00` = plug answering "not confirmed", `-` = no reply.
+It prints `connected. The plug must be in pairing mode (LED slowly blinking
+blue). If not: HOLD the plug button until the LED slowly blinks blue. Then
+SHORT-PRESS the button on the plug now <<<` and then one token per poll:
+`00` = plug IS in pairing mode (not yet confirmed), `-` = no reply (plug not
+in pairing mode or out of range).
 
-1. **Try normal mode first:** short-press the E1DD button once.
-2. If no key within ~20 s: **hold** the button until the LED slowly blinks
-   blue (pairing mode), then short-press again.
+1. **Put the plug in pairing mode first** (hold its button until the LED
+   slowly blinks blue), then short-press the button once.
+2. If you keep getting `-` for ~20 s, the plug isn't in pairing mode — repeat
+   the hold until the LED slowly blinks blue, then short-press again.
 3. On success it prints the 8-byte hex key on stdout and
    `paired. use: --skey <key>` on stderr. Then verify:
    ```bash
@@ -192,11 +205,13 @@ Developer Options → Bug report → Interactive. jadx 1.5.5 installed in Termux
 ## Open Items
 
 1. **E1DD's key is captured** (`a69f370afd964e0d`, `btsnoop_new` sess. 22–23,
-   `33 B2` accepted). The one open sub-question is *how the key was revealed to
-   the app*: those sessions show the app already holding the key (direct
-   `33 B2`, no `AA B1` polling), so whether **normal-mode short-press** suffices
-   or **pairing mode** is required is still untested live. Run `pair` on E1DD
-   at the plug to answer it — expected to return `a69f370afd964e0d`.
+   `33 B2` accepted). Sub-question **answered by the plug owner**: pairing mode
+   IS required — the app drives the flow and the plug must be in pairing mode
+   (LED slowly blinking blue, entered when it was re-paired; on a fresh plug
+   the user holds the button until the LED blinks blue) before the short-press
+   confirms. There is no BLE command to enter pairing mode, so `pair` can't
+   initiate it — only the person at the plug can. `pair` on E1DD should return
+   `a69f370afd964e0d` (put E1DD in pairing mode first).
 2. Re-verify 4DE5 toggles: captures show it answering `33 B2 3c9c9d890940b019`
    with `33 B2 00` in every session (incl. 09-16 20:26 sess. 20/24/25/26); a
    live toggle confirms end to end.
