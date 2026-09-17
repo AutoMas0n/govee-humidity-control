@@ -44,15 +44,20 @@ unbind below, not the button hold.)
 - **Pairing mode is a prerequisite (plug-owner report + APK + captures).** The
   plug must already be in pairing mode (LED slowly blinking blue) before the
   short-press confirms `AA B1 01`.
-- **How pairing mode actually starts (corrected):** the Govee app's "forget
-  device" is a **cloud unbind**, not a BLE request: `deleteDevice` →
-  `netService4Base.deleteDevice(Request4DeleteDevice)` (a network call,
-  response `UnBindDeviceFeastInfo`). The H5080 is WiFi+BLE; it holds a cloud
-  IoT session (`AB 01 04` token fetch we captured). When the account unbinds
-  it, the plug learns over **WiFi** that it's unbound and enters pairing mode
-  on its own (flashing blue). That's why "forget → add new → plug flashes":
-  the app made a cloud unbind; the plug decided to become pairable. A fresh
-  out-of-box plug is already pairable.
+- **How pairing mode actually starts (corrected, two cases):**
+  - *Fresh plug (never paired):* no WiFi configured yet, starts in pairing
+    mode on its own (flashing blue), BLE-only. WiFi creds are written to it
+    over BLE AFTER key exchange (WifiChooseAc / handle h0025) — WiFi is never
+    used to pair.
+  - *Bound plug:* already provisioned (WiFi MAC `AA 14`, IoT token `AB 01 04`)
+    and holds a cloud IoT session over WiFi. The Govee app's "forget device"
+    is a **cloud-account unbind** (`deleteDevice` →
+    `netService4Base.deleteDevice(Request4DeleteDevice)`, response
+    `UnBindDeviceFeastInfo`); the plug learns over its *existing* WiFi IoT
+    link that it is unbound and drops back into pairing mode on its own.
+    That's why "forget → add new → plug flashes": the flash is the plug
+    reacting to the cloud revocation, not a BLE pairing request. No BLE
+    command is involved — pairing itself is always BLE-only.
 - **There is no BLE "enter pairing mode" command.** The H5080 controller set
   (Switch/Timer/SyncTime/Version/Spec/Heart + `SecretKeyController(V1)`
   read/check) has none, and no capture shows any frame before the `AA B1`

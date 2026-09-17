@@ -134,17 +134,23 @@ Resp:  AA B1 <flag> [8 bytes] [padding] [XOR]
 The plug answers `00 <random>` until the user **short-presses the plug's
 button**, then answers `01 <key>`. **Pairing mode is required first**: the
 plug must already be in pairing mode (its indicator slowly blinking blue)
-before the short-press confirms. How a plug gets into pairing mode:
-- A **fresh out-of-box plug** is already pairable.
-- A **bound plug** only re-enters pairing mode after the Govee app's "forget
-  device", which is a **cloud unbind** (`deleteDevice` →
-  `netService4Base.deleteDevice(...)`, response `UnBindDeviceFeastInfo`); the
-  plug learns over its WiFi IoT link that it is unbound and starts flashing
-  on its own.
+before the short-press confirms. Pairing itself is always BLE-only; WiFi is
+never used to pair (WiFi credentials are written over BLE at handle h0025
+*after* the key exchange, if the user provisions WiFi at all).
+
+Two cases for how a plug gets into pairing mode:
+- **Fresh (never-paired) plug**: no WiFi configured; it starts in pairing
+  mode on its own and is BLE-pairable immediately.
+- **Bound plug**: already provisioned (WiFi MAC `AA 14`, IoT token
+  `AB 01 04`) and holds a cloud IoT session over WiFi. The Govee app's
+  "forget device" is a *cloud-account unbind* (`deleteDevice` →
+  `netService4Base.deleteDevice(...)`, response `UnBindDeviceFeastInfo`);
+  the plug learns over its existing WiFi IoT link that it's unbound and
+  drops back into pairing mode on its own (that's the flash the user sees).
+
 There is **no BLE command that enters pairing mode** — the H5080 controller
 set has none, and no capture shows any frame before the `AA B1` polling begins
-(only the E7 handshake + `AA 01`). The btsnoop can't see the trigger because
-the trigger is cloud-over-WiFi, not Bluetooth. While polling, `AA B1 00` means
+(only the E7 handshake + `AA 01`). While polling, `AA B1 00` means
 "in pairing mode, awaiting the press" and no reply means the plug is not in
 pairing mode (or out of range). Verified in the 2026-09-16 capture: 46×
 `AA B1 00 …`, then `AA B1 01 f6e0730a5be545e3` right after the press, once
@@ -254,11 +260,12 @@ Phase 5: WiFi provisioning (handle 0x0025)                     [BLE-only: NOT ne
 
 **Note**: `33 B2` is a **check**, never a set. The plug owns the key and
 reveals it via `AA B1` only after a physical button press while in **pairing
-mode** (plug LED slowly blinking blue). A bound plug only re-enters pairing
-mode via the Govee app's "forget device" = **cloud unbind over the plug's
-WiFi link** — there is no BLE command for it, and the app never sends one.
-A short-press in normal mode does not confirm. A fresh out-of-box plug is
-already pairable. No factory-reset or "set" is needed.
+mode** (plug LED slowly blinking blue). Pairing is BLE-only; WiFi is never
+used to pair (WiFi creds are written over BLE at h0025 after key exchange).
+A fresh plug is already pairable; a *bound* plug only re-enters pairing mode
+via the Govee app's "forget device" = **cloud-account unbind over the plug's
+existing WiFi IoT link** — there is no BLE command for it, and the app never
+sends one. A short-press in normal mode does not confirm.
 
 ## Usage
 
