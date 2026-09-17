@@ -124,7 +124,7 @@ Sanity check that pairing works at all: run the same against E245
 | Plug | MAC | Firmware | Secret key | State |
 |------|-----|----------|-----------|-------|
 | 4DE5 | `60:74:F4:BD:4D:E5` | V1 | none needed (`33 B2 3c9c9d890940b019` default works) | visible in scan again (was unreachable) |
-| E245 | `D4:AD:FC:42:E2:45` | V2+ | `f6e0730a5be545e3` (verified toggles) | working; dehumidifier plug |
+| E245 | `D4:AD:FC:42:E2:45` | V2+ | `f6e0730a5be545e3` (verified toggles) | **unbound (2026-09-17), BLE-only works**; dehumidifier plug |
 | E1DD | `D4:AD:FC:41:E1:DD` | V2+ | `a69f370afd964e0d` | paired and verified, BLE toggle works |
 | H5179 | `E3:32:81:12:40:A4` | sensor | n/a | advertisements, mfg id `0x8801` |
 
@@ -232,30 +232,21 @@ Developer Options → Bug report → Interactive. jadx 1.5.5 installed in Termux
 
 ## Open Items
 
-0. **Cloud-free transition (owner wants it — plausible).** Goal: plugs
-   unbound from Govee cloud and permanently local. Evidence:
-   - BLE toggle is a local firmware function: in sess. 13, immediately after
-     `AA B1 01` the app sends `33 B2 f6e0…` → accepted (`33 B2 00`) in the
-     same session, no WiFi/cloud involved. All captures show toggles working
-     with zero cloud traffic.
-   - Pairing itself is pure BLE; WiFi is only *provisioned after* key exchange
-     (h0025) and is never required for the toggle path.
+0. **Cloud-free transition — PROVEN on E245 (2026-09-17).** Unbound E245
+   (unbound via Govee app → pairing mode), no WiFi provisioned, tested with
+   existing key over pure BLE: `status→ON`, `off→OFF` (confirmed), `on→ON`.
+   `33 B2` accepted, `33 01` toggles execute. No cloud/account/WiFi needed
+   for control.
    Plan per plug: (a) unbind in Govee app (= cloud-account unbind; the plug
    re-enters pairing mode), (b) `govee-ble pair` to (re)read the key, (c)
    **never provision WiFi** — plug then has no cloud link to phone home to;
-   control via BLE `--skey` forever.
-   Decisive open question (needs one live test): does an *unbound, WiFi-less*
-   plug keep happily answering `33 01` toggles, or does it re-enter pairing
-   mode / nag? Nothing in the APK gates the toggle on WiFi/account (SINGLE_
-   DATE_RESET = 17 is only a WiFi-connect notify, not a reset), but the
-   firmware behavior after unbind-without-WiFi is unobserved. Test: unbind
-   E245 in app, do NOT give it WiFi, then `govee-ble on --mac … --skey …`.
-   Also unresolved: whether unbinding clears stored WiFi creds (no BLE
-   "forget WiFi / reset net" command exists in the H5080 set) — if creds
-   persist, a future power-up could still try to reach Govee infra; to be
-   strictly cloud-free that would need a WiFi-less state, a network-level
-   block (firewall/VLAN), or a reset procedure (manual: hold button —
-   untested).
+   control via BLE `--skey` forever. Verified end-to-end on E245.
+   Remaining minor questions (not blocking): does unbinding clear stored WiFi
+   creds (no BLE "forget WiFi/reset net" command in the H5080 set)? If creds
+   persist on power-up it could still reach Govee infra over WiFi; strictly
+   cloud-free would then need a network block (firewall/VLAN) or a reset
+   procedure (untested). LED behavior while unbound-and-idle (stays flashing
+   vs. settles) also unobserved — cosmetic only.
 1. **E1DD's key is captured** (`a69f370afd964e0d`, `btsnoop_new` sess. 22–23,
    `33 B2` accepted). Mechanism **resolved**: pairing mode is required before
    the short-press confirms, and a *bound* plug only re-enters pairing mode via
