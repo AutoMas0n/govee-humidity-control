@@ -34,3 +34,7 @@ openssl-*.tar.gz
 
 # Temp capture data
 captured_payloads.txt
+
+# Personal agent config
+.pi/
+.pi-web/
