@@ -5,10 +5,12 @@ Replace the Govee Home cloud app with a standalone local BLE solution for contro
 Govee H5080 smart plugs and reading H5179 humidity sensors. Zero cloud dependency.
 No enshittification. Runs on a Raspberry Pi 4 (Debian 12, armv7l).
 
-**Status (2026-09-16 end of session):** protocol is fully understood, including
-app-free pairing. `govee-ble pair` is built on the Pi and ran once against E1DD
-(timed out — user was not at the plug to press the button). The only remaining
-blocker is a physical button press.
+**Status (2026-09-17, end of session):** protocol fully understood and
+**verified against live hardware**. All keys captured and toggle-tested.
+Dehumidifier plug **identified by the owner at the socket** (off/on click
+confirmations). Tool now has named plugs (`--name` / `names`). Repo is synced
+(local, Pi, and GitHub all at `88e49a7`). **Remaining task: take it live on
+the Pi as the dehumidifier controller** — see NEXT ACTION.
 
 ---
 
@@ -77,45 +79,70 @@ unbind below, not the button hold.)
 
 ---
 
-## NEXT ACTION (do this first)
+## NEXT ACTION — GO LIVE ON THE PI (dehumidifier control)
 
-Someone must be physically at plug **E1DD** (`D4:AD:FC:41:E1:DD`).
+Project is ready; this is deployment, not research. The dehumidifier plug is
+`D4:AD:FC:41:E1:DD` (key `a69f370afd964e0d`), sensor is `E3:32:81:12:40:A4`.
+
+### 1. Bring the Pi fully up to date
 
 ```bash
 ssh pi@192.168.2.21
-cd ~/Github/govee-humidity-control/govee-ble
-sudo ./target/release/govee-ble pair --mac D4:AD:FC:41:E1:DD --timeout 120
+export PATH=$HOME/.cargo/bin:$PATH
+cd ~/Github/govee-humidity-control && git pull --ff-only && cd govee-ble && cargo build --release
 ```
 
-It prints `connected. The plug must be in pairing mode (LED slowly blinking
-blue). If not: HOLD the plug button until the LED slowly blinks blue. Then
-SHORT-PRESS the button on the plug now <<<` and then one token per poll:
-`00` = plug IS in pairing mode (not yet confirmed), `-` = no reply (plug not
-in pairing mode or out of range).
+Binary: `~/Github/govee-humidity-control/govee-ble/target/release/govee-ble`
+(needs `sudo`). **It must be rebuilt after this handover** (the binary in
+`target/` may predate the last commits).
 
-**Reality check:** the app's "forget device → add new device" puts a *bound*
-plug into pairing mode via a **cloud unbind over the plug's WiFi link** — not
-over BLE. `govee-ble pair` cannot imitate that (no BLE command exists for it,
-and unbinding would require Govee cloud access). `pair` is therefore only for
-adding a *currently pairable* plug (fresh out-of-box, or one you've rebound
-via the app).
+### 2. Sanity-check the pieces (each is a 5-second test)
 
-1. **Put the plug in pairing mode first** (hold its button until the LED
-   slowly blinks blue), then short-press the button once.
-2. If you keep getting `-` for ~20 s, the plug isn't in pairing mode — repeat
-   the hold until the LED slowly blinks blue, then short-press again.
-3. On success it prints the 8-byte hex key on stdout and
-   `paired. use: --skey <key>` on stderr. Then verify:
-   ```bash
-   sudo ./target/release/govee-ble on  --mac D4:AD:FC:41:E1:DD --skey <key>
-   sudo ./target/release/govee-ble off --mac D4:AD:FC:41:E1:DD --skey <key>
-   ```
-4. Record the key in PROTOCOL.md "Secret Keys (Captured)" table and here.
-5. Answer the open question: did normal-mode short-press work, or was
-   pairing mode required? Update PROTOCOL.md accordingly.
+```bash
+sudo ./target/release/govee-ble names                       # shows the name->MAC table
+sudo ./target/release/govee-ble status --name dehumidifier  # should print ON/OFF
+sudo ./target/release/govee-ble read --mac E3:32:81:12:40:A4  # temp/humidity/batt
+```
 
-Sanity check that pairing works at all: run the same against E245
-(`D4:AD:FC:42:E2:45`) — it should return `f6e0730a5be545e3`.
+Note: currently the `dehumidifier` plug toggles fine but the other two known
+plugs: `pi-side` (4DE5, V1, no key) is next to the Pi; `e245` is unplugged /
+out of range (it stopped responding — expected).
+
+### 3. Install the daemon as a systemd service
+
+The unit is `govee-ble/humidity-daemon.service` and already targets the
+correct plug (`D4:AD:FC:41:E1:DD` / `a69f370afd964e0d`, sensor 40A4, interval
+60 s, threshold 60%). **Edit the `--hc-url` line** to a real healthchecks URL
+(or remove it) before installing:
+
+```bash
+sudo cp govee-ble/humidity-daemon.service /etc/systemd/system/
+sudo systemctl daemon-reload
+sudo systemctl enable --now humidity-daemon
+journalctl -u humidity-daemon -f   # watch it read the sensor + toggle the plug
+```
+
+### 4. Verify the actual loop
+
+Threshold logic: sensor humidity `> --threshold` → plug ON (dehumidifier
+runs), else OFF. Confirm the dehumidifier actually switches a few times (e.g.
+set a test threshold, or just watch after a shower/bath raises humidity).
+
+### 5. Close the loop with the owner
+
+- Confirm healthcheck ping succeeds in the hc dashboard.
+- Decide the real `--threshold` (docs used 60% for the dehumidifier) and
+  `--interval` (60 s used in the unit; could be 30–120 s).
+- The two plugs named `pi-side` and `e245` are spare — renaming/room naming
+  is one-line in `PLUG_NAMES` in `govee-ble/src/main.rs` if the owner wants.
+
+---
+
+## (Reference) Earlier NEXT ACTION — pairing E1DD
+
+Retained for completeness; **already completed** (key `a69f370afd964e0d` was
+captured & toggle-verified). `govee-ble pair` on a plug requires the plug to
+be in pairing mode first.
 
 ---
 
@@ -185,9 +212,15 @@ That is where the E1DD key in the table above came from.
 |------------|------|-------------|
 | `scan` | | list BLE devices, 10 s |
 | `read` | `--mac` | H5179 temp/humidity/battery |
-| `on` / `off` / `status` | `--mac` `[--skey <hex8>]` | plug control (3 retries) |
-| `pair` | `--mac` `[--timeout 60]` | **app-free pairing**: polls `AA B1`, prints key after button press, checks with `33 B2`. `get-skey` is an alias. |
+| `on` / `off` / `status` | `--name <name>` **or** `--mac <addr> [--skey <hex8>]` | plug control (3 retries; `--name` looks up MAC+key in `PLUG_NAMES`) |
+| `names` | | print the name → MAC → key table |
+| `pair` | `--name` / `--mac` `[--timeout 60]` | app-free pairing: polls `AA B1`, prints key after button press, checks with `33 B2`. `get-skey` is an alias. |
 | `daemon` | `--plug-mac --sensor-mac [--plug-skey] [--interval] [--threshold] [--hc-url]` | humidity control loop |
+
+Named plugs live in `PLUG_NAMES` at the top of `main.rs` (no config files):
+`dehumidifier` = `D4:AD:FC:41:E1:DD` (`a69f370afd964e0d`),
+`pi-side` = `60:74:F4:BD:4D:E5` (V1, no key),
+`e245` = `D4:AD:FC:42:E2:45` (`f6e0730a5be545e3`).
 
 Deps: `btleplug`, `tokio`, `aes`, `futures`, `hex`, `log`, `env_logger`.
 No clap/reqwest/anyhow. ~1.5 MB release binary. `TZ_HOURS` const = -4.
@@ -254,20 +287,13 @@ Developer Options → Bug report → Interactive. jadx 1.5.5 installed in Termux
    cloud-free would then need a network block (firewall/VLAN) or a reset
    procedure (untested). LED behavior while unbound-and-idle (stays flashing
    vs. settles) also unobserved — cosmetic only.
-1. **E1DD's key is captured** (`a69f370afd964e0d`, `btsnoop_new` sess. 22–23,
-   `33 B2` accepted). Mechanism **resolved**: pairing mode is required before
-   the short-press confirms, and a *bound* plug only re-enters pairing mode via
-   the Govee app's "forget device" (cloud unbind over the plug's WiFi link —
-   there is no BLE command for it). `pair` works only on a plug that is
-   *already* pairable (fresh out-of-box, or one just rebooted in the app). To
-   re-read E1DD's key: unbind it in the app first, then `pair` — expected
-   `a69f370afd964e0d`.
-2. Re-verify 4DE5 toggles: captures show it answering `33 B2 3c9c9d890940b019`
-   with `33 B2 00` in every session (incl. 09-16 20:26 sess. 20/24/25/26); a
-   live toggle confirms end to end.
-3. systemd unit for `daemon` — **added** as `govee-ble/humidity-daemon.service`
-   (E245 = dehumidifier, sensor 40A4). Install: `sudo cp` to
-   `/etc/systemd/system/`, `daemon-reload`, `enable --now`.
+1. ~~E1DD's key~~ — captured (`a69f370afd964e0d`) and **toggle-verified**.
+   Mechanism resolved: pairing mode required; bound plug re-enters it via the
+   app's cloud unbind (no BLE command exists).
+2. ~~Re-verify 4DE5 toggles~~ — **done**: owner clicked it ON (next to Pi).
+3. **Deploy daemon live on the Pi** (systemd) — see NEXT ACTION. Unit exists
+   at `govee-ble/humidity-daemon.service`, targets the dehumidifier plug
+   (`D4:AD:FC:41:E1:DD`); set a real `--hc-url` first.
 4. Optional cleanup: drop the older one-off scripts now that `decode_sessions.py` supersedes them.
 5. Optional: `pair` could persist keys to a config file instead of requiring `--skey` on every call.
 
@@ -294,13 +320,13 @@ Developer Options → Bug report → Interactive. jadx 1.5.5 installed in Termux
 ## Quick Start
 
 ```bash
-# on the Pi, in govee-ble/
-sudo ./target/release/govee-ble scan
-sudo ./target/release/govee-ble pair --mac D4:AD:FC:41:E1:DD --timeout 120   # press plug button
-sudo ./target/release/govee-ble on  --mac D4:AD:FC:42:E2:45 --skey f6e0730a5be545e3
-sudo ./target/release/govee-ble off --mac D4:AD:FC:42:E2:45 --skey f6e0730a5be545e3
+# on the Pi, in govee-ble/ (rebuild first — this handover changed things)
+sudo ./target/release/govee-ble names
+sudo ./target/release/govee-ble status --name dehumidifier        # D4:AD:FC:41:E1:DD
+sudo ./target/release/govee-ble on  --name dehumidifier          # or just --mac + --skey
+sudo ./target/release/govee-ble off --name dehumidifier
 sudo ./target/release/govee-ble read --mac E3:32:81:12:40:A4
-sudo ./target/release/govee-ble daemon --plug-mac D4:AD:FC:42:E2:45 --plug-skey f6e0730a5be545e3 \
+sudo ./target/release/govee-ble daemon --plug-mac D4:AD:FC:41:E1:DD --plug-skey a69f370afd964e0d \
   --sensor-mac E3:32:81:12:40:A4 --interval 60 --threshold 60 --hc-url http://your-id.healthchecks.io
 
 # run it as a service (edit the --hc-url line in the unit first):
