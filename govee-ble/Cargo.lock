@@ -462,6 +462,7 @@ dependencies = [
  "aes",
  "btleplug",
  "env_logger",
+ "futures",
  "hex",
  "log",
  "tokio",
