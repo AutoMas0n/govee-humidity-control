@@ -125,7 +125,7 @@ Sanity check that pairing works at all: run the same against E245
 |------|-----|----------|-----------|-------|
 | 4DE5 | `60:74:F4:BD:4D:E5` | V1 | none needed (`33 B2 3c9c9d890940b019` default works) | visible in scan again (was unreachable) |
 | E245 | `D4:AD:FC:42:E2:45` | V2+ | `f6e0730a5be545e3` (verified toggles) | **unbound (2026-09-17), BLE-only works**; dehumidifier plug |
-| E1DD | `D4:AD:FC:41:E1:DD` | V2+ | `a69f370afd964e0d` | paired and verified, BLE toggle works |
+| E1DD | `D4:AD:FC:41:E1:DD` | V2+ | `a69f370afd964e0d` | **live-verified toggle 2026-09-17** (off→off, on→on) |
 | H5179 | `E3:32:81:12:40:A4` | sensor | n/a | advertisements, mfg id `0x8801` |
 
 All plugs advertise as `ihoment_H5080_XXXX`, manufacturer id `0x8843`.
