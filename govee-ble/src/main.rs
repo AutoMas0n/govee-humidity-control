@@ -19,11 +19,20 @@ const SENSOR_MAC: &str = "E3:32:81:12:40:A4";
 // identity. This table maps OUR short names to MACs - the name is what we
 // call it day-to-day; the MAC drives everything. Keys that are None mean the
 // plug is V1 (no secret key needed).
+//
+// Identity confirmed by live click-tests 2026-09-17:
+//   dehumidifier = D4:AD:FC:41:E1:DD (advertises as ihoment_H5080_E1DD)
+//                  [confirmed: off/on click at the dehumidifier]
+//   pi-side     = 60:74:F4:BD:4D:E5 (advertises as ihoment_H5080_4DE5)
+//                  [confirmed: clicked ON for the owner, next to the Pi]
+//   e245        = D4:AD:FC:42:E2:45 (advertises as ihoment_H5080_E245)
+//                  [unbound 09-17, currently unplugged/out of range]
+//
 // Edit these names to whatever you call the plugs.
 const PLUG_NAMES: &[(&str, Option<&str>, Option<&str>)] = &[
-    ("pi",           Some("60:74:F4:BD:4D:E5"), None),  // ihoment_H5080_4DE5 (V1) - was "E1DD" in my head
-    ("dehumidifier", Some("D4:AD:FC:42:E2:45"), Some("f6e0730a5be545e3")),  // ihoment_H5080_E245
-    ("third",        Some("D4:AD:FC:41:E1:DD"), Some("a69f370afd964e0d")),  // ihoment_H5080_E1DD
+    ("dehumidifier", Some("D4:AD:FC:41:E1:DD"), Some("a69f370afd964e0d")),
+    ("pi-side",      Some("60:74:F4:BD:4D:E5"), None),
+    ("e245",         Some("D4:AD:FC:42:E2:45"), Some("f6e0730a5be545e3")),
 ];
 
 fn lookup_plug(name: &str) -> Option<(&str, Option<&str>)> {
