@@ -79,62 +79,31 @@ unbind below, not the button hold.)
 
 ---
 
-## NEXT ACTION — GO LIVE ON THE PI (dehumidifier control)
+## NEXT ACTION — ✅ DONE: GO LIVE ON THE PI (dehumidifier control)
 
-Project is ready; this is deployment, not research. The dehumidifier plug is
-`D4:AD:FC:41:E1:DD` (key `a69f370afd964e0d`), sensor is `E3:32:81:12:40:A4`.
+**Completed 2026-09-18:** Pi service cut over from the cloud `main.py` (now
+stopped/disabled as `myscript.service`) to the local Rust BLE daemon
+(`humidity-daemon.service`). Threshold **45%**, interval **900 s** (matching the
+old cloud script's behaviour), status served on a local port (`--status-port
+8080`) instead of an external healthcheck — zero internet. Cloud Python files
+(`main.py`, `setup.sh`, `require.py`, `requirements.txt`) stay in the repo as
+git-history reference; the production path is `govee-ble` only.
 
-### 1. Bring the Pi fully up to date
+Status page: `curl http://192.168.2.21:8080/` →
+`temp=…C / humidity=…% / battery=…% / plug=ON|OFF / threshold / interval / ts`.
 
-```bash
-ssh pi@192.168.2.21
-export PATH=$HOME/.cargo/bin:$PATH
-cd ~/Github/govee-humidity-control && git pull --ff-only && cd govee-ble && cargo build --release
-```
+### What was done
 
-Binary: `~/Github/govee-humidity-control/govee-ble/target/release/govee-ble`
-(needs `sudo`). **It must be rebuilt after this handover** (the binary in
-`target/` may predate the last commits).
-
-### 2. Sanity-check the pieces (each is a 5-second test)
-
-```bash
-sudo ./target/release/govee-ble names                       # shows the name->MAC table
-sudo ./target/release/govee-ble status --name dehumidifier  # should print ON/OFF
-sudo ./target/release/govee-ble read --mac E3:32:81:12:40:A4  # temp/humidity/batt
-```
-
-Note: currently the `dehumidifier` plug toggles fine but the other two known
-plugs: `pi-side` (4DE5, V1, no key) is next to the Pi; `e245` is unplugged /
-out of range (it stopped responding — expected).
-
-### 3. Install the daemon as a systemd service
-
-The unit is `govee-ble/humidity-daemon.service` and already targets the
-correct plug (`D4:AD:FC:41:E1:DD` / `a69f370afd964e0d`, sensor 40A4, interval
-60 s, threshold 60%). **Edit the `--hc-url` line** to a real healthchecks URL
-(or remove it) before installing:
-
-```bash
-sudo cp govee-ble/humidity-daemon.service /etc/systemd/system/
-sudo systemctl daemon-reload
-sudo systemctl enable --now humidity-daemon
-journalctl -u humidity-daemon -f   # watch it read the sensor + toggle the plug
-```
-
-### 4. Verify the actual loop
-
-Threshold logic: sensor humidity `> --threshold` → plug ON (dehumidifier
-runs), else OFF. Confirm the dehumidifier actually switches a few times (e.g.
-set a test threshold, or just watch after a shower/bath raises humidity).
-
-### 5. Close the loop with the owner
-
-- Confirm healthcheck ping succeeds in the hc dashboard.
-- Decide the real `--threshold` (docs used 60% for the dehumidifier) and
-  `--interval` (60 s used in the unit; could be 30–120 s).
-- The two plugs named `pi-side` and `e245` are spare — renaming/room naming
-  is one-line in `PLUG_NAMES` in `govee-ble/src/main.rs` if the owner wants.
+1. `govee-ble/src/main.rs`: replaced the healthchecks.io `ping_hc` + `--hc-url`
+   with a tiny local HTTP status server (`tokio::net::TcpListener`, status
+   shared via `tokio::sync::watch::channel`). Daemon now takes
+   `--status-port N` (0 = off).
+2. `govee-ble/humidity-daemon.service`: targets dehumidifier E1DD
+   (`D4:AD:FC:41:E1:DD` / `a69f370afd964e0d`, sensor `E3:32:81:12:40:A4`),
+   `--interval 900`, `--threshold 45`, `--status-port 8080`.
+3. Pi: rebuilt release binary, `systemctl stop/disable myscript.service`,
+   `cp` unit to `/etc/systemd/system/`, `systemctl enable --now
+   humidity-daemon`. Verified: `journalctl -u humidity-daemon` + status page.
 
 ---
 
@@ -215,7 +184,7 @@ That is where the E1DD key in the table above came from.
 | `on` / `off` / `status` | `--name <name>` **or** `--mac <addr> [--skey <hex8>]` | plug control (3 retries; `--name` looks up MAC+key in `PLUG_NAMES`) |
 | `names` | | print the name → MAC → key table |
 | `pair` | `--name` / `--mac` `[--timeout 60]` | app-free pairing: polls `AA B1`, prints key after button press, checks with `33 B2`. `get-skey` is an alias. |
-| `daemon` | `--plug-mac --sensor-mac [--plug-skey] [--interval] [--threshold] [--hc-url]` | humidity control loop |
+| `daemon` | `--plug-mac --sensor-mac [--plug-skey] [--interval] [--threshold] [--status-port]` | humidity control loop; `--status-port N` serves a plain-text status page on `http://<pi>:N/` (0 = off; see `--interval`/`--threshold` defaults below) |
 
 Named plugs live in `PLUG_NAMES` at the top of `main.rs` (no config files):
 `dehumidifier` = `D4:AD:FC:41:E1:DD` (`a69f370afd964e0d`),
@@ -291,11 +260,14 @@ Developer Options → Bug report → Interactive. jadx 1.5.5 installed in Termux
    Mechanism resolved: pairing mode required; bound plug re-enters it via the
    app's cloud unbind (no BLE command exists).
 2. ~~Re-verify 4DE5 toggles~~ — **done**: owner clicked it ON (next to Pi).
-3. **Deploy daemon live on the Pi** (systemd) — see NEXT ACTION. Unit exists
-   at `govee-ble/humidity-daemon.service`, targets the dehumidifier plug
-   (`D4:AD:FC:41:E1:DD`); set a real `--hc-url` first.
+3. **Deploy daemon live on the Pi** (systemd) — **done 2026-09-18** (see NEXT
+   ACTION): `humidity-daemon.service` installed and enabled, targets the
+   dehumidifier plug (`D4:AD:FC:41:E1:DD`), threshold 45%, interval 900 s,
+   status on `--status-port 8080` (no external healthcheck).
 4. Optional cleanup: drop the older one-off scripts now that `decode_sessions.py` supersedes them.
 5. Optional: `pair` could persist keys to a config file instead of requiring `--skey` on every call.
+6. Optional: observe whether the dehumidifier cycles a few times a day at
+   45%/900 s and tune `--threshold`/`--interval` in the unit if needed.
 
 ## Resolved (don't re-investigate)
 
@@ -320,16 +292,16 @@ Developer Options → Bug report → Interactive. jadx 1.5.5 installed in Termux
 ## Quick Start
 
 ```bash
-# on the Pi, in govee-ble/ (rebuild first — this handover changed things)
+# on the Pi, in govee-ble/ (rebuild after a pull)
 sudo ./target/release/govee-ble names
 sudo ./target/release/govee-ble status --name dehumidifier        # D4:AD:FC:41:E1:DD
 sudo ./target/release/govee-ble on  --name dehumidifier          # or just --mac + --skey
 sudo ./target/release/govee-ble off --name dehumidifier
 sudo ./target/release/govee-ble read --mac E3:32:81:12:40:A4
-sudo ./target/release/govee-ble daemon --plug-mac D4:AD:FC:41:E1:DD --plug-skey a69f370afd964e0d \
-  --sensor-mac E3:32:81:12:40:A4 --interval 60 --threshold 60 --hc-url http://your-id.healthchecks.io
+# status page (daemon --status-port 8080):
+curl http://192.168.2.21:8080/
 
-# run it as a service (edit the --hc-url line in the unit first):
+# run it as a service (unit targets dehumidifier E1DD, 900 s / 45% / port 8080):
 sudo cp govee-ble/humidity-daemon.service /etc/systemd/system/
 sudo systemctl daemon-reload && sudo systemctl enable --now humidity-daemon
 ```

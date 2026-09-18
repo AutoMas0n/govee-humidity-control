@@ -382,27 +382,40 @@ async fn read_sensor(mac: &str, secs: u64) -> Result<(f32, u8, u8), String> {
     Err("H5179 not found".into())
 }
 
-// ========================= HEALTHCHECK =========================
-// ponytail: plain TCP GET, no TLS. Use http:// URLs.
-async fn ping_hc(url: &str, fail: bool) {
-    if url.is_empty() { return; }
-    let path = if fail { format!("{}/fail", url.trim_end_matches('/')) } else { url.to_string() };
-    let path = path.strip_prefix("http://").unwrap_or(&path);
-    let (host, rest) = path.split_once('/').unwrap_or((path, ""));
-    let rp = if rest.is_empty() { "/" } else { &format!("/{rest}") };
-    if let Ok(mut s) = tokio::net::TcpStream::connect(format!("{}:80", host)).await {
-        use tokio::io::{AsyncReadExt, AsyncWriteExt};
-        let req = format!("GET {rp} HTTP/1.0\r\nHost: {host}\r\nConnection: close\r\n\r\n");
-        let _ = s.write_all(req.as_bytes()).await;
-        let mut b = [0u8; 64];
-        let _ = s.read(&mut b).await;
+// ========================= LOCAL STATUS HTTP SERVER =========================
+// ponytail: replaces the external healthcheck with a local status page on the
+// Pi (http://192.168.2.21:<port>/). Zero internet, zero TLS, one text/plain
+// snapshot per connection. The daemon loop pushes the latest snapshot into a
+// tokio watch channel; the server task borrows it on each request.
+async fn status_server(port: u16, status_rx: tokio::sync::watch::Receiver<String>) {
+    let listener = tokio::net::TcpListener::bind(format!("0.0.0.0:{port}")).await.unwrap();
+    log::info!("status: http://0.0.0.0:{port}/");
+    loop {
+        match listener.accept().await {
+            Ok((mut s, _)) => {
+                let body = *status_rx.borrow();
+                let resp = format!("HTTP/1.0 200 OK\r\nContent-Type: text/plain\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                    body.len(), body);
+                use tokio::io::{AsyncReadExt, AsyncWriteExt};
+                let _ = s.write_all(resp.as_bytes()).await;
+                drop(s);
+            }
+            Err(e) => {
+                log::error!("status accept: {e}");
+                sleep(Duration::from_millis(200)).await;
+            }
+        }
     }
 }
 
 // ========================= DAEMON =========================
-async fn daemon_loop(interval_s: u64, threshold: u8, hc_url: String,
+async fn daemon_loop(interval_s: u64, threshold: u8, status_port: u16,
                      plug_mac: &str, sensor_mac: &str, plug_skey: Option<[u8; 8]>) {
     log::info!("daemon: interval={interval_s}s threshold={threshold}%");
+    let (status_tx, status_rx) = tokio::sync::watch::channel::<String>("starting...".into());
+    if status_port != 0 {
+        drop(tokio::spawn(status_server(status_port, status_rx)));
+    }
     let mut last_on: Option<bool> = None;
     loop {
         match read_sensor(sensor_mac, 10).await {
@@ -415,9 +428,20 @@ async fn daemon_loop(interval_s: u64, threshold: u8, hc_url: String,
                     else { let _ = plug_off(plug_mac, plug_skey.as_ref()).await; }
                     last_on = Some(need_on);
                 }
-                ping_hc(&hc_url, false).await;
+                let plug = if need_on { "ON" } else { "OFF" };
+                let ts = std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .map(|d| d.as_secs() as u32).unwrap_or(0);
+                let _ = status_tx.send(format!(
+                    "temp={t:.1}C\nhumidity={h}%\nbattery={b}%\nplug={plug}\nthreshold={threshold}\ninterval={interval_s}\nts={ts}\n"));
             }
-            Err(e) => { log::error!("sensor: {e}"); ping_hc(&hc_url, true).await; }
+            Err(e) => {
+                log::error!("sensor: {e}");
+                let ts = std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .map(|d| d.as_secs() as u32).unwrap_or(0);
+                let _ = status_tx.send(format!("error={e}\nts={ts}\n"));
+            }
         }
         sleep(Duration::from_secs(interval_s)).await;
     }
@@ -479,7 +503,7 @@ async fn main() {
         eprintln!("  pair:   --name <name> | --mac <addr> [--timeout SEC]  (prints secret key; plug must ALREADY be in");
         eprintln!("          pairing mode — fresh plug or one unbound in the Govee app — then short-press it)");
         eprintln!("  names:  (no args, prints the name->MAC table)");
-        eprintln!("  daemon: [--interval SEC] [--threshold PCT] [--hc-url URL]");
+        eprintln!("  daemon: [--interval SEC] [--threshold PCT] [--status-port PORT]");
         eprintln!("          [--plug-mac <addr>] [--sensor-mac <addr>] [--plug-skey <hex8>]");
         eprintln!("  Default plug MAC: {PLUG_MAC}");
         eprintln!("  Default sensor MAC: {SENSOR_MAC}");
@@ -551,7 +575,7 @@ async fn main() {
             daemon_loop(
                 get_arg(&args, "--interval").and_then(|v| v.parse().ok()).unwrap_or(900),
                 get_arg(&args, "--threshold").and_then(|v| v.parse().ok()).unwrap_or(45),
-                get_arg(&args, "--hc-url").unwrap_or_default(),
+                get_arg(&args, "--status-port").and_then(|v| v.parse().ok()).unwrap_or(0u16),
                 &get_mac(&args, "--plug-mac", PLUG_MAC),
                 &get_mac(&args, "--sensor-mac", SENSOR_MAC),
                 parse_skey(&args, "--plug-skey"),

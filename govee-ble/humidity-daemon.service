@@ -5,15 +5,16 @@ Wants=bluetooth.service
 
 [Service]
 Type=simple
-# E245 = dehumidifier plug; 40A4 = H5179 humidity sensor.
+# E1DD = dehumidifier plug; 40A4 = H5179 humidity sensor.
 # Plug takes ~10 s to appear; the daemon retries reads internally.
+# Status page: http://<pi-ip>:8080/ (humidity/temp/battery/plug/ts).
 ExecStart=/home/pi/Github/govee-humidity-control/govee-ble/target/release/govee-ble daemon \
   --plug-mac D4:AD:FC:41:E1:DD \
   --plug-skey a69f370afd964e0d \
   --sensor-mac E3:32:81:12:40:A4 \
-  --interval 60 \
-  --threshold 60 \
-  --hc-url https://hc-ping.com/your-id
+  --interval 900 \
+  --threshold 45 \
+  --status-port 8080
 WorkingDirectory=/home/pi/Github/govee-humidity-control/govee-ble
 User=root
 Restart=always
