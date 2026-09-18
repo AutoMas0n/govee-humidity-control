@@ -393,7 +393,7 @@ async fn status_server(port: u16, status_rx: tokio::sync::watch::Receiver<String
     loop {
         match listener.accept().await {
             Ok((mut s, _)) => {
-                let body = *status_rx.borrow();
+                let body = status_rx.borrow().clone();
                 let resp = format!("HTTP/1.0 200 OK\r\nContent-Type: text/plain\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
                     body.len(), body);
                 use tokio::io::{AsyncReadExt, AsyncWriteExt};
