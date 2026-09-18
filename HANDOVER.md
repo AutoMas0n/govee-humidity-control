@@ -98,12 +98,22 @@ Status page: `curl http://192.168.2.21:8080/` →
    with a tiny local HTTP status server (`tokio::net::TcpListener`, status
    shared via `tokio::sync::watch::channel`). Daemon now takes
    `--status-port N` (0 = off).
-2. `govee-ble/humidity-daemon.service`: targets dehumidifier E1DD
+2. `govee-ble/src/main.rs` — **fixed H5179 read (was never live-verified).**
+   Lookup key is `0x8801` (not `0xEC88` — that's the GATT service UUID, a
+   red herring). Payload `ec 00 01 01 <temp i16 LE /100> <hum u16 LE /100>
+   <batt>`; verified on the Pi: `23.4C 51% 86%`. Cross-checked against
+   `sensor.goveetemp_bt_hci`'s H5179 decoder.
+3. `govee-ble/humidity-daemon.service`: targets dehumidifier E1DD
    (`D4:AD:FC:41:E1:DD` / `a69f370afd964e0d`, sensor `E3:32:81:12:40:A4`),
-   `--interval 900`, `--threshold 45`, `--status-port 8080`.
-3. Pi: rebuilt release binary, `systemctl stop/disable myscript.service`,
-   `cp` unit to `/etc/systemd/system/`, `systemctl enable --now
-   humidity-daemon`. Verified: `journalctl -u humidity-daemon` + status page.
+   `--interval 900`, `--threshold 45`, `--status-port 8080`, plus
+   `Environment=RUST_LOG=info` (env_logger silences everything below `error`
+   by default — without it journald shows nothing).
+4. Pi: rebuilt release binary, `systemctl stop/disable myscript.service`
+   (the old cloud `main.py`), `cp` unit to `/etc/systemd/system/`,
+   `systemctl enable --now humidity-daemon`. Verified:
+   `journalctl -u humidity-daemon` shows sensor→need ON/OFF cycles, status
+   page live at `http://192.168.2.21:8080/`, plug confirmed ON at the socket
+   (`status --name dehumidifier` → ON).
 
 ---
 
