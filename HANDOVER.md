@@ -123,10 +123,17 @@ Sanity check that pairing works at all: run the same against E245
 
 | Plug | MAC | Firmware | Secret key | State |
 |------|-----|----------|-----------|-------|
-| 4DE5 | `60:74:F4:BD:4D:E5` | V1 | none needed (`33 B2 3c9c9d890940b019` default works) | visible in scan again (was unreachable) |
+| 4DE5 | `60:74:F4:BD:4D:E5` | V1 | none needed (`33 B2 3c9c9d890940b019` default works) | **human-verified toggle 2026-09-17** — was OFF, clicked ON on command |
 | E245 | `D4:AD:FC:42:E2:45` | V2+ | `f6e0730a5be545e3` (verified toggles) | **unbound (2026-09-17), BLE-only works**; dehumidifier plug |
-| E1DD | `D4:AD:FC:41:E1:DD` | V2+ | `a69f370afd964e0d` | **live-verified toggle 2026-09-17** (off→off, on→on) |
+| E1DD | `D4:AD:FC:41:E1:DD` | V2+ | `a69f370afd964e0d` | status-confirmed toggles 2026-09-17 (off→off, on→on); watch the right unit next time |
 | H5179 | `E3:32:81:12:40:A4` | sensor | n/a | advertisements, mfg id `0x8801` |
+
+**Naming caution (2026-09-17):** the user's mental "E1DD" turned out to be the
+physical plug at MAC `60:74:F4:BD:4D:E5` (advertised name `ihoment_H5080_4DE5`,
+which clicked ON when toggled — human-confirmed). The plug's own BLE
+advertisement carries the authoritative suffix (`H5080_4DE5`, `H5080_E245`,
+`H5080_E1DD`). Verify identity by the advertisement name / physical label
+before trusting the short names in this table.
 
 All plugs advertise as `ihoment_H5080_XXXX`, manufacturer id `0x8843`.
 
