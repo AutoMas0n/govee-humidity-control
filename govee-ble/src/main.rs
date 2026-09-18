@@ -13,6 +13,28 @@ const TZ_HOURS: i8 = -4; // sent in 33 B5 SyncTime; only affects on-device timer
 const PLUG_MAC: &str = "60:74:F4:BD:4D:E5";
 const SENSOR_MAC: &str = "E3:32:81:12:40:A4";
 
+// ========================= NAMED PLUGS =========================
+// The physical plugs have no labels (owner: "there are no labels"), so the
+// BLE advertisement suffix (ihoment_H5080_XXXX) is the only authoritative
+// identity. This table maps OUR short names to MACs - the name is what we
+// call it day-to-day; the MAC drives everything. Keys that are None mean the
+// plug is V1 (no secret key needed).
+// Edit these names to whatever you call the plugs.
+const PLUG_NAMES: &[(&str, Option<&str>, Option<&str>)] = &[
+    ("pi",           Some("60:74:F4:BD:4D:E5"), None),  // ihoment_H5080_4DE5 (V1) - was "E1DD" in my head
+    ("dehumidifier", Some("D4:AD:FC:42:E2:45"), Some("f6e0730a5be545e3")),  // ihoment_H5080_E245
+    ("third",        Some("D4:AD:FC:41:E1:DD"), Some("a69f370afd964e0d")),  // ihoment_H5080_E1DD
+];
+
+fn lookup_plug(name: &str) -> Option<(&str, Option<&str>)> {
+    for &(n, mac, skey) in PLUG_NAMES {
+        if n == name {
+            return mac.map(|m| (m, skey));
+        }
+    }
+    None
+}
+
 // ========================= CRYPTO =========================
 fn rc4(data: &[u8], key: &[u8]) -> Vec<u8> {
     let mut s: [u8; 256] = std::array::from_fn(|i| i as u8);
@@ -401,6 +423,32 @@ fn get_mac(args: &[String], name: &str, default: &str) -> String {
     get_arg(args, name).unwrap_or_else(|| default.to_string())
 }
 
+// Resolve a plug by --name (PLUG_NAMES table) or --mac/--skey.
+// Returns (mac, Option<key>). --name wins if present.
+fn resolve_plug(args: &[String]) -> (String, Option<[u8; 8]>) {
+    if let Some(n) = get_arg(args, "--name") {
+        if let Some((mac, skey)) = lookup_plug(&n) {
+            let k = skey.and_then(|h| hex::decode(h).ok()).and_then(|b| {
+                if b.len() != 8 { None } else { let mut k=[0u8;8]; k.copy_from_slice(&b); Some(k) }
+            });
+            return (mac.to_string(), k);
+        }
+        eprintln!("unknown name: {n}");
+        print_names();
+        std::process::exit(1);
+    }
+    (get_mac(args, "--mac", PLUG_MAC), parse_skey(args, "--skey"))
+}
+
+fn print_names() {
+    eprintln!("known plugs (name -> MAC [key]):");
+    for &(n, mac, skey) in PLUG_NAMES {
+        if let Some(m) = mac {
+            eprintln!("  {n:12} -> {m}  {}", skey.unwrap_or("(no key)"));
+        }
+    }
+}
+
 fn parse_skey(args: &[String], name: &str) -> Option<[u8; 8]> {
     get_arg(args, name).and_then(|s| {
         let b = hex::decode(s).ok()?;
@@ -415,17 +463,20 @@ fn parse_skey(args: &[String], name: &str) -> Option<[u8; 8]> {
 async fn main() {
     let args: Vec<String> = std::env::args().collect();
     if args.len() < 2 {
-        eprintln!("Usage: govee-ble <read|on|off|status|scan|pair|daemon>");
+        eprintln!("Usage: govee-ble <read|on|off|status|scan|pair|daemon|names>");
         eprintln!("  read:   [--mac <addr>]");
-        eprintln!("  on/off/status: [--mac <addr>] [--skey <hex8>]");
+        eprintln!("  on/off/status: [--name <name>] | [--mac <addr>] [--skey <hex8>]");
         eprintln!("  scan:   (no args, lists all nearby BLE devices 10s)");
-        eprintln!("  pair:   --mac <addr> [--timeout SEC]  (prints secret key; plug must ALREADY be in");
+        eprintln!("  pair:   --name <name> | --mac <addr> [--timeout SEC]  (prints secret key; plug must ALREADY be in");
         eprintln!("          pairing mode — fresh plug or one unbound in the Govee app — then short-press it)");
+        eprintln!("  names:  (no args, prints the name->MAC table)");
         eprintln!("  daemon: [--interval SEC] [--threshold PCT] [--hc-url URL]");
         eprintln!("          [--plug-mac <addr>] [--sensor-mac <addr>] [--plug-skey <hex8>]");
         eprintln!("  Default plug MAC: {PLUG_MAC}");
         eprintln!("  Default sensor MAC: {SENSOR_MAC}");
         eprintln!("  Secret key (8 hex bytes): --skey f6e0730a5be545e3");
+        eprintln!("  Named plugs (see PLUG_NAMES in source):");
+        print_names();
         return;
     }
     match args[1].as_str() {
@@ -433,17 +484,23 @@ async fn main() {
             Ok((t,h,b)) => println!("{t:.1}C {h}% {b}%"),
             Err(e) => { eprintln!("{e}"); std::process::exit(1); }
         },
-        "on" => match plug_on(&get_mac(&args, "--mac", PLUG_MAC), parse_skey(&args, "--skey").as_ref()).await {
-            Ok(_) => println!("ON"),
-            Err(e) => { eprintln!("{e}"); std::process::exit(1); }
+        "on" => match resolve_plug(&args) {
+            (mac, k) => match plug_on(&mac, k.as_ref()).await {
+                Ok(_) => println!("ON"),
+                Err(e) => { eprintln!("{e}"); std::process::exit(1); }
+            }
         },
-        "off" => match plug_off(&get_mac(&args, "--mac", PLUG_MAC), parse_skey(&args, "--skey").as_ref()).await {
-            Ok(_) => println!("OFF"),
-            Err(e) => { eprintln!("{e}"); std::process::exit(1); }
+        "off" => match resolve_plug(&args) {
+            (mac, k) => match plug_off(&mac, k.as_ref()).await {
+                Ok(_) => println!("OFF"),
+                Err(e) => { eprintln!("{e}"); std::process::exit(1); }
+            }
         },
-        "status" => match plug_status(&get_mac(&args, "--mac", PLUG_MAC), parse_skey(&args, "--skey").as_ref()).await {
-            Ok(s) => println!("{}", if s { "ON" } else { "OFF" }),
-            Err(e) => { eprintln!("{e}"); std::process::exit(1); }
+        "status" => match resolve_plug(&args) {
+            (mac, k) => match plug_status(&mac, k.as_ref()).await {
+                Ok(s) => println!("{}", if s { "ON" } else { "OFF" }),
+                Err(e) => { eprintln!("{e}"); std::process::exit(1); }
+            }
         },
         "scan" => {
             let c = adapter().await;
@@ -468,11 +525,14 @@ async fn main() {
             }
             c.stop_scan().await.ok();
         },
+        "names" => {
+            print_names();
+        },
         "pair" | "get-skey" => {
-            let mac = &get_mac(&args, "--mac", "");
-            if mac.is_empty() { eprintln!("--mac <addr> required"); std::process::exit(1); }
+            let (mac, _) = resolve_plug(&args);
+            if mac.is_empty() { eprintln!("--name <name> or --mac <addr> required"); std::process::exit(1); }
             let t = get_arg(&args, "--timeout").and_then(|v| v.parse().ok()).unwrap_or(60);
-            match pair(mac, t).await {
+            match pair(&mac, t).await {
                 Ok(key) => { eprintln!("paired. use: --skey {key}"); println!("{key}"); }
                 Err(e) => { eprintln!("{e}"); std::process::exit(1); }
             }
