@@ -352,10 +352,22 @@ async fn pair(plug_mac: &str, timeout_s: u64) -> Result<String, String> {
 }
 
 // ========================= H5179 =========================
+// Advertisement manufacturer data, company id 0x8801 (not 0xEC88 — that
+// value is the GATT service UUID, unrelated). Payload, 9 bytes:
+//   [0] 0xEC (packet marker)
+//   [1..3] 00 01 01 (header)
+//   [4..5] temperature, little-endian i16, two's complement, /100
+//   [6..7] humidity,     little-endian u16, /100
+//   [8]   battery %
+// Format cross-checked against sensor.goveetemp_bt_hci's H5179 decoder
+// (unpack_from("<HHB", mfg_data, 6)) and live captures on the Pi:
+//   ec 00 01 01 24 09 00 14 56 -> 23.40C / 51.20% / 86%.
 fn parse_h5179(data: &[u8]) -> Option<(f32, u8, u8)> {
-    if data.len() < 7 || data[0] != 0x88 || data[1] != 0xEC { return None; }
-    let temp = ((data[3] as i16 - 100) as f32) + data[4] as f32 / 10.0;
-    Some((temp, data[5], data[6]))
+    if data.len() < 9 || data[0] != 0xEC { return None; }
+    let raw_t = (data[5] as u16) << 8 | (data[4] as u16);
+    let temp = (raw_t as i16) as f32 / 100.0;
+    let raw_h = (data[7] as u16) << 8 | (data[6] as u16);
+    Some((temp, (raw_h / 100) as u8, data[8]))
 }
 
 async fn read_sensor(mac: &str, secs: u64) -> Result<(f32, u8, u8), String> {
@@ -367,7 +379,7 @@ async fn read_sensor(mac: &str, secs: u64) -> Result<(f32, u8, u8), String> {
         for p in c.peripherals().await.map_err(|e| format!("periphs: {e}"))? {
             if p.address().to_string().to_uppercase() != mac { continue; }
             if let Ok(Some(pr)) = p.properties().await {
-                if let Some(data) = pr.manufacturer_data.get(&0xEC88) {
+                if let Some(data) = pr.manufacturer_data.get(&0x8801) {
                     if let Some(r) = parse_h5179(data) {
                         c.stop_scan().await.ok();
                         return Ok(r);
