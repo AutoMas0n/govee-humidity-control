@@ -16,6 +16,8 @@ ExecStart=/home/pi/Github/govee-humidity-control/govee-ble/target/release/govee-
   --threshold 45 \
   --status-port 8080
 WorkingDirectory=/home/pi/Github/govee-humidity-control/govee-ble
+# env_logger silences everything below `error` unless RUST_LOG overrides it.
+Environment=RUST_LOG=info
 User=root
 Restart=always
 RestartSec=15
