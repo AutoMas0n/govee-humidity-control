@@ -105,9 +105,12 @@ Status page: `curl http://192.168.2.21:8080/` →
    `sensor.goveetemp_bt_hci`'s H5179 decoder.
 3. `govee-ble/humidity-daemon.service`: targets dehumidifier E1DD
    (`D4:AD:FC:41:E1:DD` / `a69f370afd964e0d`, sensor `E3:32:81:12:40:A4`),
-   `--interval 900`, `--threshold 45`, `--status-port 8080`, plus
-   `Environment=RUST_LOG=info` (env_logger silences everything below `error`
-   by default — without it journald shows nothing).
+   `--interval 900`, **hysteresis band `--hi 55 --lo 45`** (see
+   `openspec/changes/humidity-hysteresis-band/` — data-backed: single-45
+   chattered 6,042 cycles/yr, band 55/45 runs 318/yr at 1/10 the runtime),
+   `--status-port 8080`, plus `Environment=RUST_LOG=info` (env_logger
+   silences everything below `error` by default — without it journald shows
+   nothing).
 4. Pi: rebuilt release binary, `systemctl stop/disable myscript.service`
    (the old cloud `main.py`), `cp` unit to `/etc/systemd/system/`,
    `systemctl enable --now humidity-daemon`. Verified:
@@ -194,7 +197,7 @@ That is where the E1DD key in the table above came from.
 | `on` / `off` / `status` | `--name <name>` **or** `--mac <addr> [--skey <hex8>]` | plug control (3 retries; `--name` looks up MAC+key in `PLUG_NAMES`) |
 | `names` | | print the name → MAC → key table |
 | `pair` | `--name` / `--mac` `[--timeout 60]` | app-free pairing: polls `AA B1`, prints key after button press, checks with `33 B2`. `get-skey` is an alias. |
-| `daemon` | `--plug-mac --sensor-mac [--plug-skey] [--interval] [--threshold] [--status-port]` | humidity control loop; `--status-port N` serves a plain-text status page on `http://<pi>:N/` (0 = off; see `--interval`/`--threshold` defaults below) |
+| `daemon` | `--plug-mac --sensor-mac [--plug-skey] [--interval] [--hi] [--lo] [--status-port]` | humidity control loop with **hysteresis band** (ON ≥ hi, OFF ≤ lo, hold in between; `--threshold N` still works as band N/N); `--status-port N` serves a plain-text status page on `http://<pi>:N/` (0 = off; defaults interval 900 s, hi 55, lo 45) |
 
 Named plugs live in `PLUG_NAMES` at the top of `main.rs` (no config files):
 `dehumidifier` = `D4:AD:FC:41:E1:DD` (`a69f370afd964e0d`),
@@ -272,12 +275,17 @@ Developer Options → Bug report → Interactive. jadx 1.5.5 installed in Termux
 2. ~~Re-verify 4DE5 toggles~~ — **done**: owner clicked it ON (next to Pi).
 3. **Deploy daemon live on the Pi** (systemd) — **done 2026-09-18** (see NEXT
    ACTION): `humidity-daemon.service` installed and enabled, targets the
-   dehumidifier plug (`D4:AD:FC:41:E1:DD`), threshold 45%, interval 900 s,
-   status on `--status-port 8080` (no external healthcheck).
+   dehumidifier plug (`D4:AD:FC:41:E1:DD`), **hysteresis band hi 55 / lo 45**
+   (2026-09-19, change `humidity-hysteresis-band`), interval 900 s, status on
+   `--status-port 8080` (no external healthcheck).
 4. Optional cleanup: drop the older one-off scripts now that `decode_sessions.py` supersedes them.
 5. Optional: `pair` could persist keys to a config file instead of requiring `--skey` on every call.
-6. Optional: observe whether the dehumidifier cycles a few times a day at
-   45%/900 s and tune `--threshold`/`--interval` in the unit if needed.
+6. ~~Observe cycling + tune threshold~~ — **done 2026-09-19**: a year of
+   1-min H5179 exports (2025-09→2026-09) showed single-45 chattered ~27
+   times/day in summer; the 55/45 hysteresis band (now live) should cut that
+   to a few cycles/yr. Re-export and run
+   `scripts/humidity_analysis.py ~/govee_export --scheme band 55 45` after a
+   season to re-tune.
 
 ## Resolved (don't re-investigate)
 
