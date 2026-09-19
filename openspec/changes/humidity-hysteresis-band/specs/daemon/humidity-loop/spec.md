@@ -7,12 +7,12 @@ The SHALL run an infinite loop that reads H5179 humidity on a configurable
 interval and toggles the H5080 plug according to a hysteresis band (hi/lo),
 with state-change tracking to avoid redundant writes.
 
-#### Scenario: Humidity exceeds the high setpoint
+#### Scenario: Humidity exceeds threshold
 - **WHEN** the H5179 reading is greater than or equal to the high setpoint
   (`--hi`, default 55% RH)
 - **THEN** the daemon turns the H5080 plug ON, if it was OFF
 
-#### Scenario: Humidity returns below the low setpoint
+#### Scenario: Humidity returns below threshold
 - **WHEN** the H5179 reading drops to or below the low setpoint
   (`--lo`, default 45% RH)
 - **THEN** the daemon turns the H5080 plug OFF, if it was ON
