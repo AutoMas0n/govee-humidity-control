@@ -201,11 +201,13 @@ async fn init_plug(per: &btleplug::platform::Peripheral, sk: &[u8; 16], skey: Op
 }
 
 // ========================= PLUG CONNECTION (connect + handshake + init + action) =========================
-async fn try_plug_inner<T, Fut>(plug_mac: &str, skey: Option<&[u8; 8]>, action: impl FnOnce(btleplug::platform::Peripheral, [u8; 16]) -> Fut) -> Result<T, String>
+// c is the adapter the caller owns (respectively one per process for one-shots,
+// or the daemon's single lifetime adapter). Passed in, not created here — see
+// openspec/changes/fix-daemon-ble-session-leak.
+async fn try_plug_inner<T, Fut>(c: &btleplug::platform::Adapter, plug_mac: &str, skey: Option<&[u8; 8]>, action: impl FnOnce(btleplug::platform::Peripheral, [u8; 16]) -> Fut) -> Result<T, String>
 where Fut: Future<Output = Result<T, String>>,
 {
-    let c = adapter().await;
-    let per = find_mac(&c, plug_mac, 10).await?;
+    let per = find_mac(c, plug_mac, 10).await?;
     per.connect().await.map_err(|e| format!("conn: {e}"))?;
     sleep(Duration::from_millis(500)).await;
     per.discover_services().await.map_err(|e| format!("disc svc: {e}"))?;
@@ -213,15 +215,14 @@ where Fut: Future<Output = Result<T, String>>,
     let sk = handshake(&per).await?;
     init_plug(&per, &sk, skey).await?;
     let r = action(per, sk).await;
-    drop(c);
     r
 }
 
 // ========================= PLUG COMMANDS (each with own retry) =========================
-async fn plug_on(plug_mac: &str, skey: Option<&[u8; 8]>) -> Result<(), String> {
+async fn plug_on(c: &btleplug::platform::Adapter, plug_mac: &str, skey: Option<&[u8; 8]>) -> Result<(), String> {
     let mut err = String::new();
     for a in 0..3 {
-        match try_plug_inner(plug_mac, skey, |per, sk| Box::pin(async move {
+        match try_plug_inner(c, plug_mac, skey, |per, sk| Box::pin(async move {
             let r = write_ctrl(&per, &encrypt(&frame_from(0x33, 0x01, &[0x11]), &sk)).await;
             per.disconnect().await.ok();
             sleep(Duration::from_millis(500)).await;
@@ -234,10 +235,10 @@ async fn plug_on(plug_mac: &str, skey: Option<&[u8; 8]>) -> Result<(), String> {
     Err(format!("plug_on failed: {err}"))
 }
 
-async fn plug_off(plug_mac: &str, skey: Option<&[u8; 8]>) -> Result<(), String> {
+async fn plug_off(c: &btleplug::platform::Adapter, plug_mac: &str, skey: Option<&[u8; 8]>) -> Result<(), String> {
     let mut err = String::new();
     for a in 0..3 {
-        match try_plug_inner(plug_mac, skey, |per, sk| Box::pin(async move {
+        match try_plug_inner(c, plug_mac, skey, |per, sk| Box::pin(async move {
             let r = write_ctrl(&per, &encrypt(&frame_from(0x33, 0x01, &[0x10]), &sk)).await;
             per.disconnect().await.ok();
             sleep(Duration::from_millis(500)).await;
@@ -250,10 +251,10 @@ async fn plug_off(plug_mac: &str, skey: Option<&[u8; 8]>) -> Result<(), String> 
     Err(format!("plug_off failed: {err}"))
 }
 
-async fn plug_status(plug_mac: &str, skey: Option<&[u8; 8]>) -> Result<bool, String> {
+async fn plug_status(c: &btleplug::platform::Adapter, plug_mac: &str, skey: Option<&[u8; 8]>) -> Result<bool, String> {
     let mut err = String::new();
     for a in 0..3 {
-        match try_plug_inner(plug_mac, skey, |per, sk| Box::pin(async move {
+        match try_plug_inner(c, plug_mac, skey, |per, sk| Box::pin(async move {
             write_ctrl(&per, &encrypt(&frame_from(0xAA, 0x01, &[]), &sk)).await?;
             let mut s = per.notifications().await.map_err(|e| format!("notif: {e}"))?;
             let d = tokio::time::Instant::now() + Duration::from_secs(2);
@@ -370,8 +371,7 @@ fn parse_h5179(data: &[u8]) -> Option<(f32, u8, u8)> {
     Some((temp, (raw_h / 100) as u8, data[8]))
 }
 
-async fn read_sensor(mac: &str, secs: u64) -> Result<(f32, u8, u8), String> {
-    let c = adapter().await;
+async fn read_sensor(c: &btleplug::platform::Adapter, mac: &str, secs: u64) -> Result<(f32, u8, u8), String> {
     let mac = mac.to_uppercase();
     c.start_scan(ScanFilter::default()).await.map_err(|e| format!("scan: {e}"))?;
     let d = tokio::time::Instant::now() + Duration::from_secs(secs);
@@ -483,7 +483,7 @@ mod tests {
     }
 }
 
-async fn daemon_loop(interval_s: u64, hi: u8, lo: u8, status_port: u16,
+async fn daemon_loop(c: &btleplug::platform::Adapter, interval_s: u64, hi: u8, lo: u8, status_port: u16,
                      plug_mac: &str, sensor_mac: &str, plug_skey: Option<[u8; 8]>) {
     log::info!("daemon: interval={interval_s}s hi={hi}% lo={lo}%");
     let (status_tx, status_rx) = tokio::sync::watch::channel::<String>("starting...".into());
@@ -492,7 +492,7 @@ async fn daemon_loop(interval_s: u64, hi: u8, lo: u8, status_port: u16,
     }
     let mut last_on: Option<bool> = None;
     loop {
-        match read_sensor(sensor_mac, 10).await {
+        match read_sensor(c, sensor_mac, 10).await {
             Ok((t, h, b)) => {
                 log::info!("sensor: {t:.1}C {h}% batt={b}%");
                 // Hysteresis band: ON at >= hi, OFF at <= lo, hold in between.
@@ -501,8 +501,8 @@ async fn daemon_loop(interval_s: u64, hi: u8, lo: u8, status_port: u16,
                 let need_on = band_need_on(h, hi, lo, last_on);
                 if last_on.map(|o| o != need_on).unwrap_or(true) {
                     log::info!("need {}", if need_on { "ON" } else { "OFF" });
-                    if need_on { let _ = plug_on(plug_mac, plug_skey.as_ref()).await; }
-                    else { let _ = plug_off(plug_mac, plug_skey.as_ref()).await; }
+                    if need_on { let _ = plug_on(c, plug_mac, plug_skey.as_ref()).await; }
+                    else { let _ = plug_off(c, plug_mac, plug_skey.as_ref()).await; }
                     last_on = Some(need_on);
                 }
                 let plug = if need_on { "ON" } else { "OFF" };
@@ -590,26 +590,38 @@ async fn main() {
         return;
     }
     match args[1].as_str() {
-        "read" => match read_sensor(&get_mac(&args, "--mac", SENSOR_MAC), 10).await {
-            Ok((t,h,b)) => println!("{t:.1}C {h}% {b}%"),
-            Err(e) => { eprintln!("{e}"); std::process::exit(1); }
-        },
-        "on" => match resolve_plug(&args) {
-            (mac, k) => match plug_on(&mac, k.as_ref()).await {
-                Ok(_) => println!("ON"),
+        "read" => {
+            let c = adapter().await;
+            match read_sensor(&c, &get_mac(&args, "--mac", SENSOR_MAC), 10).await {
+                Ok((t,h,b)) => println!("{t:.1}C {h}% {b}%"),
                 Err(e) => { eprintln!("{e}"); std::process::exit(1); }
             }
         },
-        "off" => match resolve_plug(&args) {
-            (mac, k) => match plug_off(&mac, k.as_ref()).await {
-                Ok(_) => println!("OFF"),
-                Err(e) => { eprintln!("{e}"); std::process::exit(1); }
+        "on" => {
+            let c = adapter().await;
+            match resolve_plug(&args) {
+                (mac, k) => match plug_on(&c, &mac, k.as_ref()).await {
+                    Ok(_) => println!("ON"),
+                    Err(e) => { eprintln!("{e}"); std::process::exit(1); }
+                }
             }
         },
-        "status" => match resolve_plug(&args) {
-            (mac, k) => match plug_status(&mac, k.as_ref()).await {
-                Ok(s) => println!("{}", if s { "ON" } else { "OFF" }),
-                Err(e) => { eprintln!("{e}"); std::process::exit(1); }
+        "off" => {
+            let c = adapter().await;
+            match resolve_plug(&args) {
+                (mac, k) => match plug_off(&c, &mac, k.as_ref()).await {
+                    Ok(_) => println!("OFF"),
+                    Err(e) => { eprintln!("{e}"); std::process::exit(1); }
+                }
+            }
+        },
+        "status" => {
+            let c = adapter().await;
+            match resolve_plug(&args) {
+                (mac, k) => match plug_status(&c, &mac, k.as_ref()).await {
+                    Ok(s) => println!("{}", if s { "ON" } else { "OFF" }),
+                    Err(e) => { eprintln!("{e}"); std::process::exit(1); }
+                }
             }
         },
         "scan" => {
@@ -649,12 +661,16 @@ async fn main() {
         },
         "daemon" => {
             env_logger::init();
+            // One BlueZ session for the daemon's whole life — creating one per
+            // cycle leaked a D-Bus socket each time (fix-daemon-ble-session-leak).
+            let c = adapter().await;
             // Hysteresis band: --hi/--lo (defaults 55/45). --threshold N remains
             // a single-threshold alias meaning band N/N (identical to pre-band).
             let thr = get_arg(&args, "--threshold").and_then(|v| v.parse().ok());
             let hi = get_arg(&args, "--hi").and_then(|v| v.parse().ok()).or(thr).unwrap_or(55u8);
             let lo = get_arg(&args, "--lo").and_then(|v| v.parse().ok()).or(thr).unwrap_or(45u8);
             daemon_loop(
+                &c,
                 get_arg(&args, "--interval").and_then(|v| v.parse().ok()).unwrap_or(900),
                 hi,
                 lo,
