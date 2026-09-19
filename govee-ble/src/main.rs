@@ -431,7 +431,7 @@ fn band_need_on(h: u8, hi: u8, lo: u8, last_on: Option<bool>) -> bool {
     } else {
         match last_on {
             None => h >= hi,
-            Some(o) if h >= hi => true,
+            Some(_) if h >= hi => true,
             Some(_) if h <= lo => false,
             Some(o) => o,
         }
