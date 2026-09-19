@@ -45,7 +45,7 @@ with `govee-ble pair` or decode it from a btsnoop capture.
 sudo ./target/release/govee-ble daemon \
   --plug-mac D4:AD:FC:41:E1:DD --plug-skey a69f370afd964e0d \
   --sensor-mac E3:32:81:12:40:A4 \
-  --interval 900 --hi 55 --lo 45 --status-port 8080
+  --interval 900 --hi 55 --lo 45 --status-port 8843
 ```
 
 Reads the sensor every `--interval` seconds and switches the plug on when
@@ -54,7 +54,7 @@ ON ≥ hi, OFF ≤ lo, hold in between — avoids the relay chatter a single
 threshold caused, ~27 clicks/day in summer → a few per year). The old
 single-threshold `--threshold N` still works as a band-N/N alias. With
 `--status-port N` it also serves a plain-text status page on the LAN — e.g.
-`curl http://<pi-ip>:8080/` shows `temp`, `humidity`, `battery`, `plug`,
+`curl http://<pi-ip>:8843/` shows `temp`, `humidity`, `battery`, `plug`,
 `hi`, `lo` and a Unix `ts`. No cloud, no external healthcheck: everything
 stays on the Pi.
 
@@ -62,7 +62,7 @@ stays on the Pi.
 
 ```bash
 # check govee-ble/humidity-daemon.service (it targets dehumidifier E1DD,
-# interval 900 s, band hi 55 / lo 45%, status port 8080) then install it:
+# interval 900 s, band hi 55 / lo 45%, status port 8843) then install it:
 sudo cp govee-ble/humidity-daemon.service /etc/systemd/system/
 sudo systemctl daemon-reload
 sudo systemctl enable --now humidity-daemon

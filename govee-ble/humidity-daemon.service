@@ -7,7 +7,7 @@ Wants=bluetooth.service
 Type=simple
 # E1DD = dehumidifier plug; 40A4 = H5179 humidity sensor.
 # Plug takes ~10 s to appear; the daemon retries reads internally.
-# Status page: http://<pi-ip>:8080/ (humidity/temp/battery/plug/ts).
+# Status page: http://<pi-ip>:8843/ (humidity/temp/battery/plug/ts).
 ExecStart=/home/pi/Github/govee-humidity-control/govee-ble/target/release/govee-ble daemon \
   --plug-mac D4:AD:FC:41:E1:DD \
   --plug-skey a69f370afd964e0d \
@@ -15,7 +15,7 @@ ExecStart=/home/pi/Github/govee-humidity-control/govee-ble/target/release/govee-
   --interval 900 \
   --hi 55 \
   --lo 45 \
-  --status-port 8080
+  --status-port 8843
 WorkingDirectory=/home/pi/Github/govee-humidity-control/govee-ble
 # env_logger silences everything below `error` unless RUST_LOG overrides it.
 Environment=RUST_LOG=info

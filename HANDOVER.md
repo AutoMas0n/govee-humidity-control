@@ -85,12 +85,14 @@ unbind below, not the button hold.)
 stopped/disabled as `myscript.service`) to the local Rust BLE daemon
 (`humidity-daemon.service`). Threshold **45%**, interval **900 s** (matching the
 old cloud script's behaviour), status served on a local port (`--status-port
-8080`) instead of an external healthcheck — zero internet. Cloud Python files
+8843`) instead of an external healthcheck — zero internet. Cloud Python files
 (`main.py`, `setup.sh`, `require.py`, `requirements.txt`) stay in the repo as
 git-history reference; the production path is `govee-ble` only.
 
-Status page: `curl http://192.168.2.21:8080/` →
+Status page: `curl http://192.168.2.21:8843/` →
 `temp=…C / humidity=…% / battery=…% / plug=ON|OFF / threshold / interval / ts`.
+Port **8843** = the H5080 manufacturer ID (mfg id `0x8843`); chosen to avoid
+the common 8080 web port.
 
 ### What was done
 
@@ -108,14 +110,14 @@ Status page: `curl http://192.168.2.21:8080/` →
    `--interval 900`, **hysteresis band `--hi 55 --lo 45`** (see
    `openspec/changes/humidity-hysteresis-band/` — data-backed: single-45
    chattered 6,042 cycles/yr, band 55/45 runs 318/yr at 1/10 the runtime),
-   `--status-port 8080`, plus `Environment=RUST_LOG=info` (env_logger
+   `--status-port 8843`, plus `Environment=RUST_LOG=info` (env_logger
    silences everything below `error` by default — without it journald shows
    nothing).
 4. Pi: rebuilt release binary, `systemctl stop/disable myscript.service`
    (the old cloud `main.py`), `cp` unit to `/etc/systemd/system/`,
    `systemctl enable --now humidity-daemon`. Verified:
    `journalctl -u humidity-daemon` shows sensor→need ON/OFF cycles, status
-   page live at `http://192.168.2.21:8080/`, plug confirmed ON at the socket
+   page live at `http://192.168.2.21:8843/`, plug confirmed ON at the socket
    (`status --name dehumidifier` → ON).
 
 ---
@@ -277,7 +279,7 @@ Developer Options → Bug report → Interactive. jadx 1.5.5 installed in Termux
    ACTION): `humidity-daemon.service` installed and enabled, targets the
    dehumidifier plug (`D4:AD:FC:41:E1:DD`), **hysteresis band hi 55 / lo 45**
    (2026-09-19, change `humidity-hysteresis-band`), interval 900 s, status on
-   `--status-port 8080` (no external healthcheck).
+   `--status-port 8843` (no external healthcheck).
 4. Optional cleanup: drop the older one-off scripts now that `decode_sessions.py` supersedes them.
 5. Optional: `pair` could persist keys to a config file instead of requiring `--skey` on every call.
 6. ~~Observe cycling + tune threshold~~ — **done 2026-09-19**: a year of
@@ -316,10 +318,10 @@ sudo ./target/release/govee-ble status --name dehumidifier        # D4:AD:FC:41:
 sudo ./target/release/govee-ble on  --name dehumidifier          # or just --mac + --skey
 sudo ./target/release/govee-ble off --name dehumidifier
 sudo ./target/release/govee-ble read --mac E3:32:81:12:40:A4
-# status page (daemon --status-port 8080):
-curl http://192.168.2.21:8080/
+# status page (daemon --status-port 8843):
+curl http://192.168.2.21:8843/
 
-# run it as a service (unit targets dehumidifier E1DD, 900 s / 45% / port 8080):
+# run it as a service (unit targets dehumidifier E1DD, 900 s / 45% / port 8843):
 sudo cp govee-ble/humidity-daemon.service /etc/systemd/system/
 sudo systemctl daemon-reload && sudo systemctl enable --now humidity-daemon
 ```

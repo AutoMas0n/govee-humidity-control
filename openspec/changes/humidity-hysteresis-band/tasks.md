@@ -6,7 +6,7 @@
 
 ## 2. Service configuration
 
-- [x] 2.1 Update `govee-ble/humidity-daemon.service` to use `--hi 55 --lo 45` instead of `--threshold 45` — `ExecStart` now reads `--interval 900 --hi 55 --lo 45 --status-port 8080`; verified below with `systemd-analyze verify`
+- [x] 2.1 Update `govee-ble/humidity-daemon.service` to use `--hi 55 --lo 45` instead of `--threshold 45` — `ExecStart` now reads `--interval 900 --hi 55 --lo 45 --status-port 8843`; verified below with `systemd-analyze verify`
 
 ## 3. Build and live verification (on the Pi)
 
