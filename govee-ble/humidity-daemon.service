@@ -13,7 +13,8 @@ ExecStart=/home/pi/Github/govee-humidity-control/govee-ble/target/release/govee-
   --plug-skey a69f370afd964e0d \
   --sensor-mac E3:32:81:12:40:A4 \
   --interval 900 \
-  --threshold 45 \
+  --hi 55 \
+  --lo 45 \
   --status-port 8080
 WorkingDirectory=/home/pi/Github/govee-humidity-control/govee-ble
 # env_logger silences everything below `error` unless RUST_LOG overrides it.

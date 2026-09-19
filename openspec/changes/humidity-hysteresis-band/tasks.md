@@ -1,12 +1,12 @@
 ## 1. Band logic in the daemon loop
 
-- [ ] 1.1 In `govee-ble/src/main.rs`, change the daemon's `need_on` decision to a hysteresis band: ON when `h >= hi`, OFF when `h <= lo`, hold (keep `last_on`) when `lo < h < hi` — verify with a unit-style check that `(hi=55, lo=45)` holds ON between 46..54 and only changes at the boundaries
-- [ ] 1.2 Add `--hi PCT` and `--lo PCT` CLI args to the `daemon` subcommand; keep `--threshold N` as an alias meaning band N/N; defaults hi=55, lo=45 — verify `govee-ble --help` (usage text) lists `--hi`/`--lo` and that `daemon --threshold 45` behaves identically to today (ON > 45, OFF ≤ 45)
-- [ ] 1.3 Update the status-page snapshot to include `hi=` and `lo=` lines — verify `curl http://<pi>:8080/` shows `hi=55` and `lo=45` when the daemon runs with defaults
+- [x] 1.1 In `govee-ble/src/main.rs`, change the daemon's `need_on` decision to a hysteresis band: ON when `h >= hi`, OFF when `h <= lo`, hold (keep `last_on`) when `lo < h < hi` — verified with unit tests `band_*` + `threshold_alias_matches_old_single_threshold` (hold ON 46..54, boundaries at 55/45)
+- [x] 1.2 Add `--hi PCT` and `--lo PCT` CLI args to the `daemon` subcommand; keep `--threshold N` as an alias meaning band N/N; defaults hi=55, lo=45 — verified: usage text lists `--hi`/`--lo`; `--threshold 45` → hi=lo=45 → `h > 45` branch (identical to today)
+- [x] 1.3 Update the status-page snapshot to include `hi=` and `lo=` lines — status snapshot now emits `hi=`/`lo=` instead of `threshold=` (verified in live status page below)
 
 ## 2. Service configuration
 
-- [ ] 2.1 Update `govee-ble/humidity-daemon.service` to use `--hi 55 --lo 45` instead of `--threshold 45` — verify the `ExecStart` line reflects the band and the unit passes `systemd-analyze verify`
+- [x] 2.1 Update `govee-ble/humidity-daemon.service` to use `--hi 55 --lo 45` instead of `--threshold 45` — `ExecStart` now reads `--interval 900 --hi 55 --lo 45 --status-port 8080`; verified below with `systemd-analyze verify`
 
 ## 3. Build and live verification (on the Pi)
 

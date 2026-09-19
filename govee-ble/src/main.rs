@@ -421,9 +421,71 @@ async fn status_server(port: u16, status_rx: tokio::sync::watch::Receiver<String
 }
 
 // ========================= DAEMON =========================
-async fn daemon_loop(interval_s: u64, threshold: u8, status_port: u16,
+// Hysteresis band decision: ON at >= hi, OFF at <= lo, hold in between.
+// When hi == lo (the --threshold alias) this reduces exactly to the old
+// single-threshold contract: ON when h > N, OFF when h <= N. `last_on` is
+// None only on the first read — start OFF unless already over the high setpoint.
+fn band_need_on(h: u8, hi: u8, lo: u8, last_on: Option<bool>) -> bool {
+    if hi == lo {
+        h > hi
+    } else {
+        match last_on {
+            None => h >= hi,
+            Some(o) if h >= hi => true,
+            Some(_) if h <= lo => false,
+            Some(o) => o,
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn band_holds_on_inside_dead_band() {
+        // (hi=55, lo=45): once ON, stays ON between 46..54; once OFF, stays OFF
+        assert!(band_need_on(50, 55, 45, Some(true)));
+        assert!(band_need_on(54, 55, 45, Some(true)));
+        assert!(!band_need_on(46, 55, 45, Some(false)));
+        assert!(!band_need_on(54, 55, 45, Some(false)));
+    }
+
+    #[test]
+    fn band_turns_on_only_at_hi() {
+        assert!(band_need_on(55, 55, 45, Some(false)));
+        assert!(band_need_on(60, 55, 45, Some(false)));
+        assert!(!band_need_on(54, 55, 45, Some(false)));
+    }
+
+    #[test]
+    fn band_turns_off_only_at_lo() {
+        assert!(!band_need_on(45, 55, 45, Some(true)));
+        assert!(!band_need_on(30, 55, 45, Some(true)));
+        assert!(band_need_on(46, 55, 45, Some(true)));
+    }
+
+    #[test]
+    fn band_first_read_starts_off_unless_over_hi() {
+        assert!(!band_need_on(50, 55, 45, None));
+        assert!(band_need_on(55, 55, 45, None));
+        assert!(!band_need_on(45, 55, 45, None));
+    }
+
+    #[test]
+    fn threshold_alias_matches_old_single_threshold() {
+        // --threshold 45 -> hi=lo=45: ON strictly above 45, OFF at 45 and below
+        assert!(!band_need_on(45, 45, 45, None));
+        assert!(band_need_on(46, 45, 45, None));
+        assert!(band_need_on(46, 45, 45, Some(false)));
+        assert!(!band_need_on(44, 45, 45, Some(true)));
+        assert!(!band_need_on(45, 45, 45, Some(true)));
+    }
+}
+
+async fn daemon_loop(interval_s: u64, hi: u8, lo: u8, status_port: u16,
                      plug_mac: &str, sensor_mac: &str, plug_skey: Option<[u8; 8]>) {
-    log::info!("daemon: interval={interval_s}s threshold={threshold}%");
+    log::info!("daemon: interval={interval_s}s hi={hi}% lo={lo}%");
     let (status_tx, status_rx) = tokio::sync::watch::channel::<String>("starting...".into());
     if status_port != 0 {
         drop(tokio::spawn(status_server(status_port, status_rx)));
@@ -433,7 +495,10 @@ async fn daemon_loop(interval_s: u64, threshold: u8, status_port: u16,
         match read_sensor(sensor_mac, 10).await {
             Ok((t, h, b)) => {
                 log::info!("sensor: {t:.1}C {h}% batt={b}%");
-                let need_on = h > threshold;
+                // Hysteresis band: ON at >= hi, OFF at <= lo, hold in between.
+                // When hi == lo (the --threshold alias) this reduces exactly to
+                // today's single-threshold contract: ON when h > N, OFF when h <= N.
+                let need_on = band_need_on(h, hi, lo, last_on);
                 if last_on.map(|o| o != need_on).unwrap_or(true) {
                     log::info!("need {}", if need_on { "ON" } else { "OFF" });
                     if need_on { let _ = plug_on(plug_mac, plug_skey.as_ref()).await; }
@@ -445,7 +510,7 @@ async fn daemon_loop(interval_s: u64, threshold: u8, status_port: u16,
                     .duration_since(std::time::UNIX_EPOCH)
                     .map(|d| d.as_secs() as u32).unwrap_or(0);
                 let _ = status_tx.send(format!(
-                    "temp={t:.1}C\nhumidity={h}%\nbattery={b}%\nplug={plug}\nthreshold={threshold}\ninterval={interval_s}\nts={ts}\n"));
+                    "temp={t:.1}C\nhumidity={h}%\nbattery={b}%\nplug={plug}\nhi={hi}\nlo={lo}\ninterval={interval_s}\nts={ts}\n"));
             }
             Err(e) => {
                 log::error!("sensor: {e}");
@@ -515,7 +580,7 @@ async fn main() {
         eprintln!("  pair:   --name <name> | --mac <addr> [--timeout SEC]  (prints secret key; plug must ALREADY be in");
         eprintln!("          pairing mode — fresh plug or one unbound in the Govee app — then short-press it)");
         eprintln!("  names:  (no args, prints the name->MAC table)");
-        eprintln!("  daemon: [--interval SEC] [--threshold PCT] [--status-port PORT]");
+        eprintln!("  daemon: [--interval SEC] [--hi PCT] [--lo PCT] [--threshold PCT] [--status-port PORT]");
         eprintln!("          [--plug-mac <addr>] [--sensor-mac <addr>] [--plug-skey <hex8>]");
         eprintln!("  Default plug MAC: {PLUG_MAC}");
         eprintln!("  Default sensor MAC: {SENSOR_MAC}");
@@ -584,9 +649,15 @@ async fn main() {
         },
         "daemon" => {
             env_logger::init();
+            // Hysteresis band: --hi/--lo (defaults 55/45). --threshold N remains
+            // a single-threshold alias meaning band N/N (identical to pre-band).
+            let thr = get_arg(&args, "--threshold").and_then(|v| v.parse().ok());
+            let hi = get_arg(&args, "--hi").and_then(|v| v.parse().ok()).or(thr).unwrap_or(55u8);
+            let lo = get_arg(&args, "--lo").and_then(|v| v.parse().ok()).or(thr).unwrap_or(45u8);
             daemon_loop(
                 get_arg(&args, "--interval").and_then(|v| v.parse().ok()).unwrap_or(900),
-                get_arg(&args, "--threshold").and_then(|v| v.parse().ok()).unwrap_or(45),
+                hi,
+                lo,
                 get_arg(&args, "--status-port").and_then(|v| v.parse().ok()).unwrap_or(0u16),
                 &get_mac(&args, "--plug-mac", PLUG_MAC),
                 &get_mac(&args, "--sensor-mac", SENSOR_MAC),
