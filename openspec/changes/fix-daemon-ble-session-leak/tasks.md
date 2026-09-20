@@ -8,8 +8,8 @@
 ## 2. Deploy and verify leak is gone
 
 - [x] 2.1 Pushed + pulled on the Pi, `cargo build --release`, restarted `humidity-daemon` — service active, status page responds
-- [ ] 2.2 Leak check: baseline 11 fds at 01:02 post-cleanup (single daemon, PID 4931); re-measure after 2–3 cycles via scheduled task (autocare: task scheduled to recheck ~45 min later). Note: during testing a stray throwaway daemon (from the initial attempted verification) was found fighting the real one — killed; the real failed reads were caused by two daemons scanning simultaneously
-- [ ] 2.3 (Optional, next day) confirm reads still succeeding and fds remain flat
+- [x] 2.2 Leak check: baseline 11 fds at 01:02, re-checked 46 min / 4 cycles later = 11 fds — **flat, no per-cycle growth** (pre-fix would have been ~46 by 8.7 h; +4 by now). Note: 2/4 cycles still showed `H5179 not found` in an ok/fail/ok/fail pattern — investigation shows this tracks **sensor RSSI at the BLE range edge** (−82 dBm, sometimes reported as +0/unset by btleplug), not the adapter; one-shot reads succeed 6/6 at the same moments. Leak verdict: **fixed**. Sensor range is a pre-existing, separate concern.
+- [ ] 2.3 Next day: confirm reads still succeeding and fds remain flat; treat further `H5179 not found` cycles as a **sensor range** matter (possible fixes if it matters: move sensor closer, add a second scan pass per cycle, or check battery) — do NOT re-investigate the daemon unless fds grow
 
 ## 3. Docs
 
