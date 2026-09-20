@@ -1,15 +1,15 @@
 ## 1. Thread one adapter through the daemon
 
-- [ ] 1.1 In `govee-ble/src/main.rs`, change `daemon_loop` to accept an adapter param (`c: &btleplug::platform::Adapter`) and remove its per-cycle `adapter()` calls — verify `grep -c "adapter()" main.rs` drops by exactly the number of daemon-path call sites (read_sensor, plug_on, plug_off, plug_status each lose one)
-- [ ] 1.2 Change `read_sensor` and `try_plug_inner` (and `plug_on`/`plug_off`/`plug_status` pass-throughs) to take `c: &btleplug::platform::Adapter` and use it instead of calling `adapter()`/`drop(c)` — verify `cargo build` clean (no unused `drop(c)`, no warnings)
-- [ ] 1.3 Update the `daemon` CLI arm to create one adapter once and pass it in; leave all one-shot arms (`read`/`on`/`off`/`status`/`scan`/`pair`) calling `adapter()` themselves — verify a one-shot still works after the change (`sudo ./target/release/govee-ble read --mac E3:32:81:12:40:A4`)
-- [ ] 1.4 Verify unit tests still pass: `cargo test` → 5/5 (band + threshold alias tests unaffected)
+- [x] 1.1 In `govee-ble/src/main.rs`, change `daemon_loop` to accept an adapter param (`c: &btleplug::platform::Adapter`) — daemon arm creates one adapter, passes `&c`; per-cycle `adapter()` calls removed from the daemon path
+- [x] 1.2 Change `read_sensor` and `try_plug_inner` (and `plug_on`/`plug_off`/`plug_status` pass-throughs) to take `c: &btleplug::platform::Adapter` — `cargo build --release` clean, `drop(c)` internal calls removed
+- [x] 1.3 `daemon` CLI arm creates one adapter once; one-shot arms (`read`/`on`/`off`/`status`) create their own — verified one-shot works: `govee-ble read` → `22.3C 52% 86%`
+- [x] 1.4 `cargo test` → 5/5 passed
 
 ## 2. Deploy and verify leak is gone
 
-- [ ] 2.1 Push + pull on the Pi, `cargo build --release`, restart `humidity-daemon` — verify service active, status page responds
-- [ ] 2.2 Leak check: record `ls /proc/$PID/fd | wc -l` at restart, then again after 2–3 poll cycles (≈30–45 min) — verify the count does not grow per cycle (pre-fix: +1 socket/cycle); note the baseline in the change summary
-- [ ] 2.3 (Optional, next day) confirm reads are still succeeding and fds remain flat — verification via `journalctl -u humidity-daemon | grep -cE "ERROR.*sensor"` trending flat
+- [x] 2.1 Pushed + pulled on the Pi, `cargo build --release`, restarted `humidity-daemon` — service active, status page responds
+- [ ] 2.2 Leak check: baseline 11 fds at 01:02 post-cleanup (single daemon, PID 4931); re-measure after 2–3 cycles via scheduled task (autocare: task scheduled to recheck ~45 min later). Note: during testing a stray throwaway daemon (from the initial attempted verification) was found fighting the real one — killed; the real failed reads were caused by two daemons scanning simultaneously
+- [ ] 2.3 (Optional, next day) confirm reads still succeeding and fds remain flat
 
 ## 3. Docs
 

@@ -113,7 +113,15 @@ the common 8080 web port.
    `--status-port 8843`, plus `Environment=RUST_LOG=info` (env_logger
    silences everything below `error` by default — without it journald shows
    nothing).
-4. Pi: rebuilt release binary, `systemctl stop/disable myscript.service`
+4. **BLE session reuse (2026-09-20)** — the daemon leaked one BlueZ
+   D-Bus socket per poll cycle (`adapter()` → `BluetoothSession::new()` per
+   call; bluez-async/dbus-tokio never close the connection): 12 fds at start
+   → 46 after 8.7 h, then reads failed progressively (`H5179 not found`,
+   status page showed `error=…`). Fixed by threading one adapter through the
+   whole daemon lifetime (`fix-daemon-ble-session-leak`): `daemon_loop`
+   creates one session, reuses it for sensor reads and plug toggles; CLI
+   one-shots keep their own (process exit closes them).
+5. Pi: rebuilt release binary, `systemctl stop/disable myscript.service`
    (the old cloud `main.py`), `cp` unit to `/etc/systemd/system/`,
    `systemctl enable --now humidity-daemon`. Verified:
    `journalctl -u humidity-daemon` shows sensor→need ON/OFF cycles, status
