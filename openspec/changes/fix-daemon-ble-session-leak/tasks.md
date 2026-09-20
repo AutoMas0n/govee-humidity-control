@@ -9,9 +9,9 @@
 
 - [x] 2.1 Pushed + pulled on the Pi, `cargo build --release`, restarted `humidity-daemon` — service active, status page responds
 - [x] 2.2 Leak check: baseline 11 fds at 01:02, re-checked 46 min / 4 cycles later = 11 fds — **flat, no per-cycle growth** (pre-fix would have been ~46 by 8.7 h; +4 by now). Note: 2/4 cycles still showed `H5179 not found` in an ok/fail/ok/fail pattern — investigation shows this tracks **sensor RSSI at the BLE range edge** (−82 dBm, sometimes reported as +0/unset by btleplug), not the adapter; one-shot reads succeed 6/6 at the same moments. Leak verdict: **fixed**. Sensor range is a pre-existing, separate concern.
-- [ ] 2.3 Next day: confirm reads still succeeding and fds remain flat; treat further `H5179 not found` cycles as a **sensor range** matter (possible fixes if it matters: move sensor closer, add a second scan pass per cycle, or check battery) — do NOT re-investigate the daemon unless fds grow
+- [x] 2.3 Next-day confirm (2026-09-20, ~07:36 uptime): fds still **11** (flat, no growth; pre-fix 46 at 8.7h); NRestarts=1 (06:00 restart, unrelated); 131 ok / 31 fail of 162 cycles ≈ 19% — isolated misses, no acceleration (pre-fix failures clustered into consecutive runs as fds grew). Sensor range remains the residual cause; follow up later by comparing new exported data (see HANDOVER note).
 
 ## 3. Docs
 
-- [ ] 3.1 Add a line to `HANDOVER.md` under the daemon section: daemon reuses one BlueZ session (was leaking ~1 fd/cycle, fixed via `fix-daemon-ble-session-leak`) — verify the doc reads true after the fd check in 2.2
-- [ ] 3.2 Commit and push; sync the Pi (`git pull`) — verify `git status` clean on both
+- [x] 3.1 HANDOVER note added (commit 97c7f62): "BLE session reuse (2026-09-20)" entry documenting the leak + fix — verified accurate against 2.2/2.3 fd results
+- [x] 3.2 Committed + pushed (97c7f62, b9bc888, + docs), Pi synced — `git status` clean on both
