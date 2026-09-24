@@ -451,6 +451,8 @@ pub fn now_epoch() -> u64 {
 const FORCE_FILE: &str = "/var/lib/humidity/force_until";
 
 fn write_force_file(until: Option<u64>) {
+    // File must survive reboots; ensure the directory exists (design.md 3b).
+    let _ = std::fs::create_dir_all("/var/lib/humidity");
     let r = match until {
         Some(t) => std::fs::write(FORCE_FILE, t.to_string()),
         None => std::fs::remove_file(FORCE_FILE),
