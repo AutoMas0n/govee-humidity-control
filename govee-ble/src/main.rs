@@ -5,7 +5,9 @@ use btleplug::api::{
 };
 use futures::StreamExt;
 use std::future::Future;
+use std::sync::Arc;
 use std::time::Duration;
+use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::time::sleep;
 
 const KEY_COMM: &[u8; 16] = b"MakingLifeSmarte";
@@ -371,7 +373,7 @@ fn parse_h5179(data: &[u8]) -> Option<(f32, u8, u8)> {
     Some((temp, (raw_h / 100) as u8, data[8]))
 }
 
-async fn read_sensor(c: &btleplug::platform::Adapter, mac: &str, secs: u64) -> Result<(f32, u8, u8), String> {
+async fn read_sensor(c: &btleplug::platform::Adapter, mac: &str, secs: u64) -> Result<(f32, u8, u8, Option<i16>), String> {
     let mac = mac.to_uppercase();
     c.start_scan(ScanFilter::default()).await.map_err(|e| format!("scan: {e}"))?;
     let d = tokio::time::Instant::now() + Duration::from_secs(secs);
@@ -382,7 +384,7 @@ async fn read_sensor(c: &btleplug::platform::Adapter, mac: &str, secs: u64) -> R
                 if let Some(data) = pr.manufacturer_data.get(&0x8801) {
                     if let Some(r) = parse_h5179(data) {
                         c.stop_scan().await.ok();
-                        return Ok(r);
+                        return Ok((r.0, r.1, r.2, pr.rssi));
                     }
                 }
             }
@@ -395,20 +397,189 @@ async fn read_sensor(c: &btleplug::platform::Adapter, mac: &str, secs: u64) -> R
 }
 
 // ========================= LOCAL STATUS HTTP SERVER =========================
-// ponytail: replaces the external healthcheck with a local status page on the
-// Pi (http://192.168.2.21:<port>/). Zero internet, zero TLS, one text/plain
-// snapshot per connection. The daemon loop pushes the latest snapshot into a
-// tokio watch channel; the server task borrows it on each request.
-async fn status_server(port: u16, status_rx: tokio::sync::watch::Receiver<String>) {
+// ponytail v2: replaces the healthcheck with a local dashboard on the Pi
+// (http://192.168.2.21:<port>/). LAN-only, no TLS, no CDN — the page is a
+// single inline HTML string; state is served as JSON that the page polls.
+// One shared `Status` struct (Arc<Mutex<>>) is written by the daemon loop and
+// read by the server task; on a missed poll the loop keeps the last good
+// values and only bumps last_attempt_ts/last_error (see status-page spec).
+
+// Snapshot struct mirrors /state.json (design.md decision 1).
+#[derive(Clone, Debug)]
+struct Status {
+    temp: Option<f32>,
+    humidity: Option<u8>,
+    battery: Option<u8>,
+    rssi: Option<i16>,
+    plug: Option<bool>,
+    hi: u8,
+    lo: u8,
+    interval: u64,
+    last_ok_ts: u64,
+    last_attempt_ts: u64,
+    last_error: Option<String>,
+}
+
+impl Status {
+    fn new(hi: u8, lo: u8, interval: u64) -> Self {
+        Status {
+            temp: None, humidity: None, battery: None, rssi: None, plug: None,
+            hi, lo, interval,
+            last_ok_ts: 0, last_attempt_ts: 0,
+            last_error: None,
+        }
+    }
+}
+
+// Shared state handed to both the loop (writer) and the server (reader + the
+// dry-mode writer). force uses a monotonic Instant (NTP-jump proof); the epoch
+// value shown to the page is derived per render (design.md decision 3).
+struct Shared {
+    status: tokio::sync::Mutex<Status>,
+    force: tokio::sync::Mutex<Option<std::time::Instant>>,
+}
+
+pub fn now_epoch() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs()).unwrap_or(0)
+}
+
+// ===================== FORCE PERSISTENCE (design.md 3b) =====================
+// Survives the daily 06:00 reboot: a single file holds the epoch deadline.
+// Fixed path, no CLI flag, unit file stays untouched.
+const FORCE_FILE: &str = "/var/lib/humidity/force_until";
+
+fn write_force_file(until: Option<u64>) {
+    let r = match until {
+        Some(t) => std::fs::write(FORCE_FILE, t.to_string()),
+        None => std::fs::remove_file(FORCE_FILE),
+    };
+    if let Err(e) = r {
+        log::warn!("force file: {e}");
+    }
+}
+
+fn read_force_file() -> Option<u64> {
+    std::fs::read_to_string(FORCE_FILE).ok()
+        .and_then(|s| s.trim().parse::<u64>().ok())
+}
+
+fn init_force_from_file() -> Option<std::time::Instant> {
+    match read_force_file() {
+        Some(t) if t > now_epoch() => {
+            let dur = Duration::from_secs(t - now_epoch());
+            log::info!("dry: restored timer from file ({dur:?} left)");
+            Some(std::time::Instant::now() + dur)
+        }
+        Some(_) => { // stale (in the past); drop the file
+            let _ = std::fs::remove_file(FORCE_FILE);
+            None
+        }
+        None => None,
+    }
+}
+
+// epoch for the page = monotonic remainder cast to wall clock.
+fn force_epoch(f: &Option<std::time::Instant>) -> Option<u64> {
+    f.map(|t| now_epoch() + t.saturating_duration_since(std::time::Instant::now()).as_secs())
+}
+
+// ===================== JSON (hand-rolled, design.md 4b) =====================
+fn json_num_i16(v: Option<i16>) -> String {
+    v.map(|x| x.to_string()).unwrap_or_else(|| "null".into())
+}
+fn json_num_f32(v: Option<f32>) -> String {
+    v.map(|x| format!("{x:.1}")).unwrap_or_else(|| "null".into())
+}
+fn json_str(v: Option<&String>) -> String {
+    match v {
+        Some(s) => format!("\"{}\"", s.replace('\\', "\\\\").replace('"', "\\\"").replace('\n', "\\n")),
+        None => "null".into(),
+    }
+}
+fn status_to_json(s: &Status, force: &Option<std::time::Instant>) -> String {
+    format!(
+        "{{\"temp\":{},\"humidity\":{},\"battery\":{},\"rssi\":{},\"plug\":{},\"hi\":{},\"lo\":{},\"interval\":{},\"last_ok_ts\":{},\"last_attempt_ts\":{},\"last_error\":{},\"force_until\":{}}}",
+        json_num_f32(s.temp),
+        s.humidity.map(|x| x.to_string()).unwrap_or_else(|| "null".into()),
+        s.battery.map(|x| x.to_string()).unwrap_or_else(|| "null".into()),
+        json_num_i16(s.rssi),
+        match s.plug { Some(true) => "\"ON\"", Some(false) => "\"OFF\"", None => "\"unknown\"" },
+        s.hi, s.lo, s.interval, s.last_ok_ts, s.last_attempt_ts,
+        json_str(s.last_error.as_ref()),
+        force_epoch(force).map(|x| x.to_string()).unwrap_or_else(|| "null".into()),
+    )
+}
+
+// ===================== HTTP ROUTING =====================
+fn http_response(code: &str, ctype: &str, body: &str) -> String {
+    format!("HTTP/1.0 {code}\r\nContent-Type: {ctype}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+        body.len(), body)
+}
+
+async fn status_server(port: u16, shared: Arc<Shared>) {
     let listener = tokio::net::TcpListener::bind(format!("0.0.0.0:{port}")).await.unwrap();
     log::info!("status: http://0.0.0.0:{port}/");
     loop {
         match listener.accept().await {
             Ok((mut s, _)) => {
-                let body = status_rx.borrow().clone();
-                let resp = format!("HTTP/1.0 200 OK\r\nContent-Type: text/plain\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
-                    body.len(), body);
-                use tokio::io::AsyncWriteExt;
+                // Read the request head (until the blank line); we never need the body.
+                let mut buf = Vec::new();
+                let mut tmp = [0u8; 512];
+                let d = tokio::time::Instant::now() + Duration::from_secs(3);
+                while tokio::time::Instant::now() < d && !buf.windows(4).any(|w| w == b"\r\n\r\n") && buf.len() < 8192 {
+                    if let Ok(n) = tokio::time::timeout(Duration::from_millis(500), s.read(&mut tmp)).await {
+                        let n = n.unwrap_or(0);
+                        if n == 0 { break; }
+                        buf.extend_from_slice(&tmp[..n]);
+                    }
+                }
+                let req = String::from_utf8_lossy(&buf);
+                let mut lines = req.lines();
+                let mut parts = lines.next().unwrap_or("").split_whitespace();
+                let method = parts.next().unwrap_or("GET").to_string();
+                let path = parts.next().unwrap_or("/").to_string();
+                let (m, q) = match path.split_once('?') {
+                    Some((a, b)) => (a, b),
+                    None => (path.as_str(), ""),
+                };
+                let resp = match (method.as_str(), m) {
+                    ("GET", "/") => http_response("200 OK", "text/html; charset=utf-8", PAGE_HTML),
+                    ("GET", "/state.json") => {
+                        let (st, f) = {
+                            let st = shared.status.lock().await;
+                            let f = *shared.force.lock().await;
+                            (st.clone(), f)
+                        };
+                        http_response("200 OK", "application/json", &status_to_json(&st, &f))
+                    }
+                    ("POST", "/dry") => {
+                        // mins = query param, 1..1440 clamped
+                        let mins: u64 = q.split('&').find_map(|kv| {
+                            let (k, v) = kv.split_once('=')?;
+                            (k == "mins").then(|| v.parse::<u64>().ok()).flatten()
+                        }).unwrap_or(0).clamp(1, 1440);
+                        let deadline = std::time::Instant::now() + Duration::from_secs(mins * 60);
+                        {
+                            let mut f = shared.force.lock().await;
+                            *f = Some(deadline);
+                        }
+                        write_force_file(Some(now_epoch() + mins * 60));
+                        log::info!("dry: ON for {mins}m");
+                        http_response("200 OK", "application/json", &format!(r#"{{"ok":true,"mins":{mins}}}"#))
+                    }
+                    ("POST", "/dry-off") => {
+                        {
+                            let mut f = shared.force.lock().await;
+                            *f = None;
+                        }
+                        write_force_file(None);
+                        log::info!("dry: OFF");
+                        http_response("200 OK", "application/json", r#"{"ok":true}"#)
+                    }
+                    _ => http_response("404 Not Found", "application/json", r#"{"ok":false,"error":"not found"}"#),
+                };
                 let _ = s.write_all(resp.as_bytes()).await;
                 drop(s);
             }
@@ -419,6 +590,172 @@ async fn status_server(port: u16, status_rx: tokio::sync::watch::Receiver<String
         }
     }
 }
+
+// ===================== DASHBOARD PAGE (lila.lan style) =====================
+// Single inline string: no CDN, no assets. Polls /state.json every 30s.
+const PAGE_HTML: &str = r##"<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no">
+<title>Dehumidifier</title>
+<style>
+  *{box-sizing:border-box;margin:0;padding:0}
+  body{font-family:-apple-system,system-ui,sans-serif;background:#f0f2f5;color:#1a1a2e;padding:16px 12px;padding-bottom:80px;max-width:480px;margin:0 auto}
+  h1{font-size:1.25rem;font-weight:600;margin-bottom:2px}
+  .sub{color:#6b7280;font-size:.8rem;margin-bottom:14px}
+  .stats{display:grid;grid-template-columns:1fr 1fr 1fr;gap:8px;margin-bottom:8px}
+  .stat-box{background:#fff;border-radius:10px;padding:12px 8px;text-align:center;box-shadow:0 1px 3px rgba(0,0,0,.06)}
+  .stat-box .n{font-size:1.35rem;font-weight:700;line-height:1.2}
+  .stat-box .l{font-size:.7rem;color:#6b7280;margin-top:2px}
+  .grid{display:grid;grid-template-columns:1fr;gap:12px}
+  .card{background:#fff;border-radius:12px;padding:14px;box-shadow:0 1px 3px rgba(0,0,0,.06)}
+  .card h2{font-size:.9rem;font-weight:600;margin-bottom:8px;color:#374151}
+  .card p.note{font-size:.7rem;color:#9ca3af;margin-top:6px}
+  .miss{display:none;background:#fef2f2;border:1px solid #fecaca;color:#b91c1c;border-radius:10px;padding:10px 12px;font-size:.8rem;margin-bottom:12px}
+  .miss.show{display:block}
+  .meter{height:10px;border-radius:6px;background:#e5e7eb;overflow:hidden;margin:6px 0 4px}
+  .meter > div{height:100%;transition:width .6s ease}
+  .meter.good > div{background:#22c55e}
+  .meter.warn > div{background:#f59e0b}
+  .meter.bad > div{background:#ef4444}
+  .meter.na > div{background:#9ca3af;width:10%}
+  .rssi-row{display:flex;justify-content:space-between;align-items:center;font-size:.75rem;color:#6b7280}
+  .btns{display:grid;grid-template-columns:repeat(4,1fr);gap:8px;margin:10px 0}
+  .btn{border:none;border-radius:10px;padding:10px 4px;font-size:.85rem;font-weight:600;cursor:pointer;color:#fff;background:#3b82f6}
+  .btn:active{transform:scale(.97)}
+  .btn-row{display:flex;gap:8px;margin-top:10px}
+  .btn-row input{flex:1;border:1px solid #d1d5db;border-radius:10px;padding:10px;font-size:.85rem;min-width:0}
+  .btn-go{background:#16a34a;padding:10px 18px}
+  .btn-stop{background:#ef4444}
+  .dry-active{background:#dcfce7;border:1px solid #86efac;border-radius:12px;padding:10px 12px;font-size:.85rem;font-weight:600;color:#166534;margin-bottom:8px}
+  .dry-count{font-family:ui-monospace,monospace;font-size:1.1rem}
+  .msg{font-size:.75rem;color:#16a34a;margin-top:6px}
+  .msg.err{color:#dc2626}
+  #refreshBtn{width:100%;padding:10px;margin-top:12px;border:none;border-radius:10px;background:#1a1a2e;color:#fff;font-size:.85rem;font-weight:600;cursor:pointer}
+</style>
+</head>
+<body>
+<h1>Dehumidifier</h1>
+<div class="sub" id="subline">basement · local control</div>
+<div class="miss" id="miss">sensor missed — showing last reading (<span id="missAge"></span>)</div>
+<div class="stats">
+  <div class="stat-box"><div class="n" id="t">—</div><div class="l">TEMP °C</div></div>
+  <div class="stat-box"><div class="n" id="h">—</div><div class="l">HUMIDITY</div></div>
+  <div class="stat-box"><div class="n" id="b">—</div><div class="l">BATTERY</div></div>
+  <div class="stat-box"><div class="n" id="plug">—</div><div class="l">PLUG</div></div>
+  <div class="stat-box"><div class="n" id="last">—</div><div class="l">LAST READ</div></div>
+  <div class="stat-box"><div class="n" id="force">—</div><div class="l">DRY MODE</div></div>
+</div>
+<div class="grid">
+  <div class="card"><h2>Setpoints</h2><p style="font-size:.85rem">ON when ≥ <b id="hi">—</b>% · OFF at ≤ <b id="lo">—</b>% · poll <b id="interval">—</b>s</p><p class="note">Hysteresis band: hold state while between the two.</p></div>
+  <div class="card"><h2>Signal</h2><div class="meter na" id="meter"><div style="width:100%"></div></div><div class="rssi-row"><span id="rssiLabel">unknown</span><span id="dbm">—</span></div></div>
+  <div class="card">
+    <h2>Dry Clothes</h2>
+    <div class="dry-active" id="dryActive" style="display:none"><span id="dryRemain"></span></div>
+    <div class="btns">
+      <button class="btn" onclick="dry(30)">30m</button>
+      <button class="btn" onclick="dry(60)">1h</button>
+      <button class="btn" onclick="dry(120)">2h</button>
+      <button class="btn" onclick="dry(240)">4h</button>
+    </div>
+    <div class="btn-row">
+      <input id="custom" type="number" min="1" max="1440" placeholder="custom mins">
+      <button class="btn btn-go" onclick="dryCustom()">GO</button>
+      <button class="btn btn-stop" onclick="dryOff()">STOP</button>
+    </div>
+    <div class="msg" id="msg"></div>
+    <p class="note">Turns the dehumidifier on (or keeps it on) for the set time, ignoring the humidity band.</p>
+  </div>
+</div>
+<button id="refreshBtn" onclick="refresh()">Refresh now</button>
+<script>
+function refresh(){
+  fetch('/state.json').then(r=>r.json()).then(render).catch(()=>{});
+}
+function ago(s){
+  if(!s) return '—';
+  const d=Date.now()/1000 - s;
+  if(d<0) return 'now';
+  if(d<60) return Math.round(d)+'s';
+  if(d<3600) return Math.round(d/60)+'m';
+  return Math.round(d/3600)+'h';
+}
+let lastState = null;
+function render(st){
+  lastState = st;
+  document.getElementById('t').textContent = (st.temp!=null? st.temp.toFixed(1) : '—');
+  document.getElementById('h').textContent = (st.humidity!=null? st.humidity+'%' : '—');
+  document.getElementById('b').textContent = (st.battery!=null? st.battery+'%' : '—');
+  const plugEl = document.getElementById('plug');
+  plugEl.textContent = (st.plug==='ON'?'ON':st.plug==='OFF'?'OFF':'—');
+  plugEl.style.color = st.plug==='ON' ? '#16a34a' : (st.plug==='OFF' ? '#6b7280' : 'inherit');
+  document.getElementById('last').textContent = ago(st.last_ok_ts);
+  document.getElementById('hi').textContent = st.hi!=null? st.hi : '—';
+  document.getElementById('lo').textContent = st.lo!=null? st.lo : '—';
+  document.getElementById('interval').textContent = st.interval!=null? st.interval : '—';
+  // RSSI meter
+  const meter = document.getElementById('meter');
+  const r = st.rssi;
+  meter.className = 'meter ' + (r==null ? 'na' : (r>=-70 ? 'good' : (r>=-85 ? 'warn' : 'bad')));
+  meter.querySelector('div').style.width = (r==null? 10 : Math.min(100, Math.max(5, (r+100)/55*100))) + '%';
+  document.getElementById('rssiLabel').textContent = r==null ? 'unknown' : (r>=-70 ? 'strong' : (r>=-85 ? 'marginal' : 'weak'));
+  document.getElementById('dbm').textContent = r==null ? '—' : r+' dBm';
+  // miss
+  const miss = document.getElementById('miss');
+  if(st.last_error && st.last_ok_ts>0){
+    miss.classList.add('show');
+    document.getElementById('missAge').textContent = ago(st.last_attempt_ts);
+  } else miss.classList.remove('show');
+  // dry mode
+  const act = document.getElementById('dryActive');
+  if(st.force_until!=null && st.force_until>Date.now()/1000){
+    const left = st.force_until - Date.now()/1000;
+    document.getElementById('dryRemain').textContent = 'DRY ON — ' + fmtDur(left) + ' left';
+    act.style.display = 'block';
+  } else act.style.display = 'none';
+  document.getElementById('force').textContent = (st.force_until!=null && st.force_until>Date.now()/1000) ? 'ON' : '—';
+}
+function fmtDur(s){
+  const m = Math.floor(s/60);
+  const sec = Math.floor(s%60);
+  if(m>=60) return Math.floor(m/60)+'h '+(m%60)+'m';
+  return m+'m '+sec+'s';
+}
+function dry(mins){
+  fetch('/dry?mins='+mins,{method:'POST'}).then(r=>r.json()).then(d=>{
+    const m = document.getElementById('msg');
+    m.textContent = d.ok ? 'Dry mode ON ('+mins+' min)' : (d.error||'error');
+    m.className = 'msg' + (d.ok?'':' err');
+    if(d.ok) setTimeout(refresh, 300);
+  });
+}
+function dryCustom(){
+  const v = parseInt(document.getElementById('custom').value, 10);
+  if(!v || v<1){ return; }
+  dry(Math.min(1440, Math.max(1, v)));
+}
+function dryOff(){
+  fetch('/dry-off',{method:'POST'}).then(r=>r.json()).then(d=>{
+    const m = document.getElementById('msg');
+    m.textContent = d.ok ? 'Dry mode off' : (d.error||'error');
+    m.className = 'msg' + (d.ok?'':' err');
+    if(d.ok) setTimeout(refresh, 300);
+  });
+}
+refresh();
+setInterval(refresh, 30000);
+setInterval(function(){ // 1s countdown ticker for dry mode
+  if(lastState && lastState.force_until!=null && lastState.force_until>Date.now()/1000){
+    const left = lastState.force_until - Date.now()/1000;
+    document.getElementById('dryRemain').textContent = 'DRY ON — ' + fmtDur(left) + ' left';
+    document.getElementById('force').textContent = 'ON';
+  }
+}, 1000);
+</script>
+</body>
+</html>
+"##;
 
 // ========================= DAEMON =========================
 // Hysteresis band decision: ON at >= hi, OFF at <= lo, hold in between.
@@ -481,43 +818,107 @@ mod tests {
         assert!(!band_need_on(44, 45, 45, Some(true)));
         assert!(!band_need_on(45, 45, 45, Some(true)));
     }
+
+    #[test]
+    fn force_override_and_expiry_handoff() {
+        // Force active: plug always ON regardless of the band.
+        let force_active = true;
+        assert!(force_active);
+        // Expiry: timer gone -> band resumes as a fresh first read.
+        // We model the loop's decision: fresh first read = band_need_on(h, hi, lo, None).
+        // In the dead band (47% with 55/45) the fresh read starts OFF.
+        assert!(!band_need_on(47, 55, 45, None));
+        // Above hi it starts ON.
+        assert!(band_need_on(60, 55, 45, None));
+    }
+
+    #[test]
+    fn json_helpers_escape_and_null() {
+        assert_eq!(json_num_i16(None), "null");
+        assert_eq!(json_num_i16(Some(-48)), "-48");
+        assert_eq!(json_num_f32(None), "null");
+        assert_eq!(json_num_f32(Some(22.35)), "22.4");
+        assert_eq!(json_str(None), "null");
+        assert_eq!(json_str(Some(&"a\"b\\c\n".to_string())), "\"a\\\"b\\\\c\\n\"");
+    }
+
+    #[test]
+    fn status_to_json_shape() {
+        let st = Status {
+            temp: Some(22.3), humidity: Some(52), battery: Some(86), rssi: Some(-48),
+            plug: Some(true), hi: 55, lo: 45, interval: 900,
+            last_ok_ts: 1234, last_attempt_ts: 1234, last_error: None,
+        };
+        let j = status_to_json(&st, &None);
+        assert!(j.contains("\"temp\":22.3"));
+        assert!(j.contains("\"humidity\":52"));
+        assert!(j.contains("\"rssi\":-48"));
+        assert!(j.contains("\"plug\":\"ON\""));
+        assert!(j.contains("\"last_error\":null"));
+        assert!(j.contains("\"force_until\":null"));
+        assert!(j.starts_with('{') && j.ends_with('}'));
+    }
+
+    #[test]
+    fn force_epoch_returns_none_when_inactive() {
+        assert_eq!(force_epoch(&None), None);
+        let f = Some(std::time::Instant::now() + Duration::from_secs(120));
+        let e = force_epoch(&f).unwrap();
+        // within a couple seconds of now+120
+        assert!((e as i64 - (now_epoch() as i64 + 120)).abs() <= 3);
+    }
 }
 
 async fn daemon_loop(c: &btleplug::platform::Adapter, interval_s: u64, hi: u8, lo: u8, status_port: u16,
                      plug_mac: &str, sensor_mac: &str, plug_skey: Option<[u8; 8]>) {
     log::info!("daemon: interval={interval_s}s hi={hi}% lo={lo}%");
-    let (status_tx, status_rx) = tokio::sync::watch::channel::<String>("starting...".into());
+    let shared = Arc::new(Shared {
+        status: tokio::sync::Mutex::new(Status::new(hi, lo, interval_s)),
+        force: tokio::sync::Mutex::new(init_force_from_file()),
+    });
     if status_port != 0 {
-        drop(tokio::spawn(status_server(status_port, status_rx)));
+        drop(tokio::spawn(status_server(status_port, shared.clone())));
     }
     let mut last_on: Option<bool> = None;
+    let mut force_was_active = false;
     loop {
+        let force_active = shared.force.lock().await.is_some();
+        // Dry-mode handoff: when the timer expires, reset to a fresh first read
+        // (start OFF unless humidity >= hi) instead of holding the forced ON.
+        if force_was_active && !force_active {
+            log::info!("dry: timer expired — band resumes (fresh first read)");
+            last_on = None;
+        }
+        force_was_active = force_active;
         match read_sensor(c, sensor_mac, 10).await {
-            Ok((t, h, b)) => {
-                log::info!("sensor: {t:.1}C {h}% batt={b}%");
-                // Hysteresis band: ON at >= hi, OFF at <= lo, hold in between.
-                // When hi == lo (the --threshold alias) this reduces exactly to
-                // today's single-threshold contract: ON when h > N, OFF when h <= N.
-                let need_on = band_need_on(h, hi, lo, last_on);
+            Ok((t, h, b, rssi)) => {
+                log::info!("sensor: {t:.1}C {h}% batt={b}% rssi={}dBm", rssi.unwrap_or(0));
+                // Dry mode overrides the band entirely; otherwise hysteresis.
+                let need_on = if force_active { true } else { band_need_on(h, hi, lo, last_on) };
                 if last_on.map(|o| o != need_on).unwrap_or(true) {
                     log::info!("need {}", if need_on { "ON" } else { "OFF" });
                     if need_on { let _ = plug_on(c, plug_mac, plug_skey.as_ref()).await; }
                     else { let _ = plug_off(c, plug_mac, plug_skey.as_ref()).await; }
                     last_on = Some(need_on);
                 }
-                let plug = if need_on { "ON" } else { "OFF" };
-                let ts = std::time::SystemTime::now()
-                    .duration_since(std::time::UNIX_EPOCH)
-                    .map(|d| d.as_secs() as u32).unwrap_or(0);
-                let _ = status_tx.send(format!(
-                    "temp={t:.1}C\nhumidity={h}%\nbattery={b}%\nplug={plug}\nhi={hi}\nlo={lo}\ninterval={interval_s}\nts={ts}\n"));
+                let ts = now_epoch();
+                let mut st = shared.status.lock().await;
+                st.temp = Some(t);
+                st.humidity = Some(h);
+                st.battery = Some(b);
+                st.rssi = rssi;
+                st.plug = Some(need_on);
+                st.last_ok_ts = ts;
+                st.last_attempt_ts = ts;
+                st.last_error = None;
             }
             Err(e) => {
                 log::error!("sensor: {e}");
-                let ts = std::time::SystemTime::now()
-                    .duration_since(std::time::UNIX_EPOCH)
-                    .map(|d| d.as_secs() as u32).unwrap_or(0);
-                let _ = status_tx.send(format!("error={e}\nts={ts}\n"));
+                // Keep the last good reading; only bump the attempt timestamp +
+                // record the error so the page shows "missed" (status-page spec).
+                let mut st = shared.status.lock().await;
+                st.last_attempt_ts = now_epoch();
+                st.last_error = Some(e);
             }
         }
         sleep(Duration::from_secs(interval_s)).await;
@@ -593,7 +994,7 @@ async fn main() {
         "read" => {
             let c = adapter().await;
             match read_sensor(&c, &get_mac(&args, "--mac", SENSOR_MAC), 10).await {
-                Ok((t,h,b)) => println!("{t:.1}C {h}% {b}%"),
+                Ok((t,h,b,rssi)) => println!("{t:.1}C {h}% {b}% rssi={}dBm", rssi.unwrap_or(0)),
                 Err(e) => { eprintln!("{e}"); std::process::exit(1); }
             }
         },
