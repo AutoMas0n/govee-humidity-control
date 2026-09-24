@@ -14,6 +14,7 @@
 
 - [x] 3.1 Replace the watch-channel snapshot in `status_server` with the shared-mutex `Status`; implement `GET /state.json` serializing it (serde_json) and `GET /` returning the HTML page; verify `curl http://localhost:8843/state.json` on the Pi returns JSON with all fields
 - [x] 3.2 Implement `POST /dry?mins=N` (clamped 1..1440) and `POST /dry-off` mutating force state and returning a JSON ack, plus a 404 branch for unknown paths; verify with `curl -X POST 'http://localhost:8843/dry?mins=60'` then `state.json` shows `force_until` set, and `POST /dry-off` clears it
+- [x] 3.3 (added during apply) Implement `POST /poll` — signals the loop for an immediate sensor read, rate-limited to 1/30s returning 429+retry_after; split the page JS so auto-refresh stays cache-only while the manual Refresh button calls `/poll` then re-fetches; verify live: first poll ok (fresh state.json), immediate second poll → HTTP 429 retry_after
 
 ## 4. HTML dashboard (lila.lan style)
 
@@ -27,5 +28,5 @@
 - [ ] 5.1 Commit + push; on the Pi `git pull`, `cargo build --release`, restart `humidity-daemon`; verify `systemctl is-active` and that both `GET /` (HTML) and `GET /state.json` respond on port 8843
 - [x] 5.2 Live test: run a force session (`POST /dry?mins=10`), confirm the status page shows dry mode + countdown, confirm `journalctl` shows plug ON held through a band-off condition, and confirm expiry returns control to the band (humidity below lo turns plug OFF)
 - [x] 5.2b Persistence live test: while a dry session is active, `sudo systemctl restart humidity-daemon`; confirm the countdown/force_until survives the restart (spec: "Force mode survives daemon restart"), and that a stale past deadline from the file is ignored on boot
-- [ ] 5.3 Verify miss-retention live: with the sensor temporarily unreachable (e.g. cover/battery pull for one cycle), confirm the page keeps last good values with a miss indicator and recovers after the sensor returns; restore sensor and confirm the RSSI meter is green at the foil-dish position
+- [x] 5.3 Verify miss-retention live: sensor moved out of range ~22:36Z Sep 24 — state.json retained last good values with last_attempt_ts advanced + last_error set, page served 200 with banner JS; after restoring the sensor a live poll (`POST /poll`) recovered: fresh last_ok_ts, last_error null, banner clear, RSSI green — **both parts verified live 2026-09-24**
 - [ ] 5.4 Update HANDOVER.md status-page + dry-mode sections; commit + push; sync the Pi; confirm `git status` clean on both

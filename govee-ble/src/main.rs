@@ -439,8 +439,14 @@ impl Status {
 struct Shared {
     status: tokio::sync::Mutex<Status>,
     force: tokio::sync::Mutex<Option<std::time::Instant>>,
+    last_poll: tokio::sync::Mutex<Option<std::time::Instant>>,
     notify: tokio::sync::Notify,
 }
+
+// Manual "Refresh now" live-poll throttle: 1 sensor read / 30s (each poll
+// runs a ~10s BLE scan, so tighter would hammer the radio). Rate limit does
+// NOT apply to the daemon's own cycle or to dry-mode wakeups.
+const POLL_MIN_INTERVAL: Duration = Duration::from_secs(30);
 
 pub fn now_epoch() -> u64 {
     std::time::SystemTime::now()
@@ -585,6 +591,27 @@ async fn status_server(port: u16, shared: Arc<Shared>) {
                         log::info!("dry: OFF");
                         http_response("200 OK", "application/json", r#"{"ok":true}"#)
                     }
+                    ("POST", "/poll") => {
+                        // Manual live read; rate-limited so the radio can breathe.
+                        let (allowed, wait) = {
+                            let mut lp = shared.last_poll.lock().await;
+                            match *lp {
+                                Some(t) if t.elapsed() < POLL_MIN_INTERVAL => {
+                                    let rem = POLL_MIN_INTERVAL.saturating_sub(t.elapsed());
+                                    (false, rem.as_secs())
+                                }
+                                _ => { *lp = Some(std::time::Instant::now()); (true, 0u64) }
+                            }
+                        };
+                        if allowed {
+                            shared.notify.notify_one(); // wake loop for an immediate read
+                            log::info!("poll: manual read requested");
+                            http_response("200 OK", "application/json", r#"{"ok":true}"#)
+                        } else {
+                            http_response("429 Too Many Requests", "application/json",
+                                &format!(r#"{{"ok":false,"error":"rate limited","retry_after":{wait}}}"#))
+                        }
+                    }
                     _ => http_response("404 Not Found", "application/json", r#"{"ok":false,"error":"not found"}"#),
                 };
                 let _ = s.write_all(resp.as_bytes()).await;
@@ -677,9 +704,6 @@ const PAGE_HTML: &str = r##"<!DOCTYPE html>
 </div>
 <button id="refreshBtn" onclick="refresh()">Refresh now</button>
 <script>
-function refresh(){
-  fetch('/state.json').then(r=>r.json()).then(render).catch(()=>{});
-}
 function ago(s){
   if(!s) return '—';
   const d=Date.now()/1000 - s;
@@ -729,6 +753,22 @@ function fmtDur(s){
   if(m>=60) return Math.floor(m/60)+'h '+(m%60)+'m';
   return m+'m '+sec+'s';
 }
+function refresh(){
+  // Manual: request a LIVE sensor read (rate-limited server-side), then show
+  // the fresh state. Auto-refresh stays cheap cache-only — see refreshTimer.
+  const btn = document.getElementById('refreshBtn');
+  btn.disabled = true;
+  btn.textContent = 'Reading…';
+  fetch('/poll',{method:'POST'}).then(r=>r.json()).then(function(d){
+    if(!d.ok && d.retry_after){ btn.textContent = 'Wait '+d.retry_after+'s'; return; }
+    fetchState();
+  }).catch(function(){ fetchState(); }).finally(function(){
+    setTimeout(function(){ btn.textContent = 'Refresh now'; btn.disabled = false; }, 1500);
+  });
+}
+function fetchState(){
+  fetch('/state.json').then(r=>r.json()).then(render).catch(()=>{});
+}
 function dry(mins){
   fetch('/dry?mins='+mins,{method:'POST'}).then(r=>r.json()).then(d=>{
     const m = document.getElementById('msg');
@@ -751,7 +791,7 @@ function dryOff(){
   });
 }
 refresh();
-setInterval(refresh, 30000);
+setInterval(fetchState, 30000); // auto-refresh: cache only, no live scans
 setInterval(function(){ // 1s countdown ticker for dry mode
   if(lastState && lastState.force_until!=null && lastState.force_until>Date.now()/1000){
     const left = lastState.force_until - Date.now()/1000;
@@ -882,6 +922,7 @@ async fn daemon_loop(c: &btleplug::platform::Adapter, interval_s: u64, hi: u8, l
     let shared = Arc::new(Shared {
         status: tokio::sync::Mutex::new(Status::new(hi, lo, interval_s)),
         force: tokio::sync::Mutex::new(init_force_from_file()),
+        last_poll: tokio::sync::Mutex::new(None),
         notify: tokio::sync::Notify::new(),
     });
     if status_port != 0 {

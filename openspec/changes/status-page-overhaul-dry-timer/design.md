@@ -76,6 +76,9 @@ Requests are read with `tokio::io::AsyncReadExt` (read until the double-CRLF), h
 ### 4b. JSON serialization: hand-rolled, no new dependency
 `/state.json` is a flat 13-field object with one free-text field (`last_error`). Serde/serde_json are **not** in the project's dependency tree (Cargo.toml: btleplug, tokio, aes, log, env_logger, futures, hex) and the BLE payload code is already byte-level with no serde derives. Rather than add serde_json for one flat struct, serialize with a small hand-rolled `format!`-based function: numbers via direct field output, `rssi`/`force_until`/`last_error` as `null` when absent, and the error string escaped only for `"`/`\\`/newline. Escapes are trivial to unit test. If the state ever grows nested structures, switch to serde_json then — YAGNI now.
 
+### 4c. Manual live poll (`POST /poll`, rate-limited) — added during apply
+Live testing found the spec'd "manual refresh re-fetches /state.json" felt dead: the daemon only reads the sensor every 15 min, so tapping refresh showed no change. Added `POST /poll`: it pings the shared `Notify` (same channel the dry timer uses) so the loop runs a sensor read immediately (~3 s), then the page re-fetches state. Throttled to **1 poll / 30 s** (each poll is a ~10 s BLE scan; tighter would constantly occupy the radio) — 429 + `retry_after` beyond that. The 30 s auto-refresh stays **cache-only** (`/state.json`), so the page never scans on its own timer — only deliberate user taps do.
+
 ### 5. HTML page: single static string, lila.lan visual language
 Inline `<style>` mirroring lila's look (max-width 480px, `-apple-system` stack, stat-box grid, rounded cards, `#1a1a2e`/`#6b7280` accents). One `<script>` block does:
 

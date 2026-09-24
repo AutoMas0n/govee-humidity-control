@@ -207,7 +207,7 @@ That is where the E1DD key in the table above came from.
 | `on` / `off` / `status` | `--name <name>` **or** `--mac <addr> [--skey <hex8>]` | plug control (3 retries; `--name` looks up MAC+key in `PLUG_NAMES`) |
 | `names` | | print the name → MAC → key table |
 | `pair` | `--name` / `--mac` `[--timeout 60]` | app-free pairing: polls `AA B1`, prints key after button press, checks with `33 B2`. `get-skey` is an alias. |
-| `daemon` | `--plug-mac --sensor-mac [--plug-skey] [--interval] [--hi] [--lo] [--status-port]` | humidity control loop with **hysteresis band** (ON ≥ hi, OFF ≤ lo, hold in between; `--threshold N` still works as band N/N); `--status-port N` serves a plain-text status page on `http://<pi>:N/` (0 = off; defaults interval 900 s, hi 55, lo 45) |
+| `daemon` | `--plug-mac --sensor-mac [--plug-skey] [--interval] [--hi] [--lo] [--status-port]` | humidity control loop with **hysteresis band** (ON ≥ hi, OFF ≤ lo, hold in between; `--threshold N` still works as band N/N); `--status-port N` serves an HTML dashboard on `http://<pi>:N/` with `/state.json` + `/poll`, `/dry`, `/dry-off` endpoints (0 = off; defaults interval 900 s, hi 55, lo 45) |
 
 Named plugs live in `PLUG_NAMES` at the top of `main.rs` (no config files):
 `dehumidifier` = `D4:AD:FC:41:E1:DD` (`a69f370afd964e0d`),
@@ -326,8 +326,17 @@ sudo ./target/release/govee-ble status --name dehumidifier        # D4:AD:FC:41:
 sudo ./target/release/govee-ble on  --name dehumidifier          # or just --mac + --skey
 sudo ./target/release/govee-ble off --name dehumidifier
 sudo ./target/release/govee-ble read --mac E3:32:81:12:40:A4
-# status page (daemon --status-port 8843):
-curl http://192.168.2.21:8843/
+# status page (daemon --status-port 8843) — mobile dashboard, lila.lan style:
+curl http://192.168.2.21:8843/                      # HTML dashboard (auto-refresh 30s)
+curl http://192.168.2.21:8843/state.json            # JSON state (machine-readable)
+curl -X POST http://192.168.2.21:8843/poll          # manual live sensor read (1/30s)
+curl -X POST 'http://192.168.2.21:8843/dry?mins=60' # dry mode: force dehumidifier ON 60 min
+curl -X POST http://192.168.2.21:8843/dry-off       # cancel dry mode
+#   Dry mode = plug held ON until the timer expires (survives the daily 06:00
+#   reboot via /var/lib/humidity/force_until), then the band resumes as a fresh
+#   first read. Missed polls keep the last good reading on the page with a
+#   "missed" banner (no more blank error page). RSSI meter: green ≥-70, amber
+#   -70..-85, red <-85 dBm.
 
 # run it as a service (unit targets dehumidifier E1DD, 900 s / 45% / port 8843):
 sudo cp govee-ble/humidity-daemon.service /etc/systemd/system/

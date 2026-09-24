@@ -77,7 +77,11 @@ The dashboard SHALL refresh its state automatically by polling `/state.json`.
 
 #### Scenario: Manual refresh
 - **WHEN** a user taps the refresh control
-- **THEN** the dashboard immediately re-fetches `/state.json`
+- **THEN** the dashboard requests a live sensor read (`POST /poll`) and then re-fetches `/state.json`, showing the fresh data
+
+#### Scenario: Manual refresh is rate-limited
+- **WHEN** a user taps refresh more often than once every 30 seconds
+- **THEN** the server responds 429 with a retry-after hint and the button shows a short wait before the next attempt
 
 ### Requirement: Dry-mode control via page
 The dashboard SHALL provide controls to start and cancel dry mode: preset duration buttons (30 min, 1 h, 2 h, 4 h), a custom-minutes input, and a cancel control, all sending the corresponding request to the status server.
