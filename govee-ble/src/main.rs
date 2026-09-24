@@ -433,10 +433,13 @@ impl Status {
 
 // Shared state handed to both the loop (writer) and the server (reader + the
 // dry-mode writer). force uses a monotonic Instant (NTP-jump proof); the epoch
-// value shown to the page is derived per render (design.md decision 3).
+// value shown to the page is derived per render (design.md decision 3). The
+// Notify wakes the loop the moment dry state changes, so a short timer (or a
+// stop) acts immediately instead of waiting for the next 15-min poll.
 struct Shared {
     status: tokio::sync::Mutex<Status>,
     force: tokio::sync::Mutex<Option<std::time::Instant>>,
+    notify: tokio::sync::Notify,
 }
 
 pub fn now_epoch() -> u64 {
@@ -568,6 +571,7 @@ async fn status_server(port: u16, shared: Arc<Shared>) {
                             *f = Some(deadline);
                         }
                         write_force_file(Some(now_epoch() + mins * 60));
+                        shared.notify.notify_one(); // wake the loop NOW (short timers)
                         log::info!("dry: ON for {mins}m");
                         http_response("200 OK", "application/json", &format!(r#"{{"ok":true,"mins":{mins}}}"#))
                     }
@@ -577,6 +581,7 @@ async fn status_server(port: u16, shared: Arc<Shared>) {
                             *f = None;
                         }
                         write_force_file(None);
+                        shared.notify.notify_one(); // re-evaluate band immediately
                         log::info!("dry: OFF");
                         http_response("200 OK", "application/json", r#"{"ok":true}"#)
                     }
@@ -877,6 +882,7 @@ async fn daemon_loop(c: &btleplug::platform::Adapter, interval_s: u64, hi: u8, l
     let shared = Arc::new(Shared {
         status: tokio::sync::Mutex::new(Status::new(hi, lo, interval_s)),
         force: tokio::sync::Mutex::new(init_force_from_file()),
+        notify: tokio::sync::Notify::new(),
     });
     if status_port != 0 {
         drop(tokio::spawn(status_server(status_port, shared.clone())));
@@ -884,10 +890,16 @@ async fn daemon_loop(c: &btleplug::platform::Adapter, interval_s: u64, hi: u8, l
     let mut last_on: Option<bool> = None;
     let mut force_was_active = false;
     loop {
-        let force_active = shared.force.lock().await.is_some();
-        // Dry-mode handoff: when the timer expires, reset to a fresh first read
-        // (start OFF unless humidity >= hi) instead of holding the forced ON.
+        // Force is active only while the deadline is in the FUTURE. The mutex
+        // keeps the deadline set until a cycle notices it expired (or a
+        // /dry-off clears it), so `is_some()` alone is NOT enough — checking
+        // it would never turn off after natural expiry.
+        let force_active = { let f = shared.force.lock().await; *f > Some(std::time::Instant::now()) };
         if force_was_active && !force_active {
+            // Natural expiry (or dry-off): clear the deadline + file so state.json
+            // goes honest, and reset to a fresh first read (start OFF unless >= hi).
+            *shared.force.lock().await = None;
+            write_force_file(None);
             log::info!("dry: timer expired — band resumes (fresh first read)");
             last_on = None;
         }
@@ -923,7 +935,22 @@ async fn daemon_loop(c: &btleplug::platform::Adapter, interval_s: u64, hi: u8, l
                 st.last_error = Some(e);
             }
         }
-        sleep(Duration::from_secs(interval_s)).await;
+        // Sleep until the next poll — or until the dry timer ends, whichever is
+        // sooner — and wake immediately when dry state changes (server notifies).
+        let sleep_dur = {
+            let f = shared.force.lock().await;
+            match *f {
+                Some(deadline) => {
+                    let until = deadline.saturating_duration_since(std::time::Instant::now());
+                    Duration::from_secs(interval_s).min(until)
+                }
+                None => Duration::from_secs(interval_s),
+            }
+        };
+        tokio::select! {
+            _ = sleep(sleep_dur) => {}
+            _ = shared.notify.notified() => {}
+        }
     }
 }
 

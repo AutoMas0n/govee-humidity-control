@@ -48,6 +48,8 @@ A `force_until: Option<std::time::Instant>` (wrapped in the same shared state or
   ```
   where `force_active()` = `force_until.map(|t| t > now).unwrap_or(false)`. When it flips from active→expired, `last_on` is reset to `None` so the next poll is a *fresh first read* (start OFF unless h ≥ hi) — the agreed handoff semantics.
 
+**Implementation note (found in live testing):** the loop must act *immediately* on force changes, not at the next 15-min poll — a 1-minute timer otherwise expires between polls and never fires. A `tokio::sync::Notify` in the shared state is signaled by `POST /dry` and `POST /dry-off`; the loop's sleep becomes `select!(sleep(min(interval, time-to-deadline)) | notify)`, so short timers fire within ~2 s and natural expiry wakes the loop at the deadline. `force_active()` compares the deadline against `Instant::now()` — never `Option::is_some()` alone, or the expired deadline would keep the plug ON forever (a bug caught and fixed in the 1-minute test).
+
 - *Why instant over UNIX ts in Status?* The loop does wall-clock comparisons; `Instant` is monotonic and immune to NTP jumps. `Status.force_until` (epoch seconds) is derived for the page's countdown.
 - *Why a separate mutex vs reusing Status?* Keep them separate (or a small `Control` struct alongside `Status`) so the server's write of `force_until` can't block on a status update. Simpler alternative considered: one mutex holding both — acceptable but slightly more coupling; decide in code, both satisfy the spec.
 

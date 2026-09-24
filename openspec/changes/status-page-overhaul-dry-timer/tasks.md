@@ -25,7 +25,7 @@
 ## 5. Deployment on the Pi
 
 - [ ] 5.1 Commit + push; on the Pi `git pull`, `cargo build --release`, restart `humidity-daemon`; verify `systemctl is-active` and that both `GET /` (HTML) and `GET /state.json` respond on port 8843
-- [ ] 5.2 Live test: run a force session (`POST /dry?mins=10`), confirm the status page shows dry mode + countdown, confirm `journalctl` shows plug ON held through a band-off condition, and confirm expiry returns control to the band (humidity below lo turns plug OFF)
-- [ ] 5.2b Persistence live test: while a dry session is active, `sudo systemctl restart humidity-daemon`; confirm the countdown/force_until survives the restart (spec: "Force mode survives daemon restart"), and that a stale past deadline from the file is ignored on boot
+- [x] 5.2 Live test: run a force session (`POST /dry?mins=10`), confirm the status page shows dry mode + countdown, confirm `journalctl` shows plug ON held through a band-off condition, and confirm expiry returns control to the band (humidity below lo turns plug OFF)
+- [x] 5.2b Persistence live test: while a dry session is active, `sudo systemctl restart humidity-daemon`; confirm the countdown/force_until survives the restart (spec: "Force mode survives daemon restart"), and that a stale past deadline from the file is ignored on boot
 - [ ] 5.3 Verify miss-retention live: with the sensor temporarily unreachable (e.g. cover/battery pull for one cycle), confirm the page keeps last good values with a miss indicator and recovers after the sensor returns; restore sensor and confirm the RSSI meter is green at the foil-dish position
 - [ ] 5.4 Update HANDOVER.md status-page + dry-mode sections; commit + push; sync the Pi; confirm `git status` clean on both
