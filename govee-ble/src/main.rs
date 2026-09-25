@@ -440,6 +440,10 @@ struct Shared {
     status: tokio::sync::Mutex<Status>,
     force: tokio::sync::Mutex<Option<std::time::Instant>>,
     last_poll: tokio::sync::Mutex<Option<std::time::Instant>>,
+    // Poll completion signal: the loop bumps generations after every sensor
+    // attempt (success or error); POST /poll waits for a bump so the page never
+    // reads state mid-scan (the "blank on first tap" race).
+    gen: tokio::sync::watch::Sender<u64>,
     notify: tokio::sync::Notify,
 }
 
@@ -447,6 +451,8 @@ struct Shared {
 // runs a ~10s BLE scan, so tighter would hammer the radio). Rate limit does
 // NOT apply to the daemon's own cycle or to dry-mode wakeups.
 const POLL_MIN_INTERVAL: Duration = Duration::from_secs(30);
+// How long POST /poll will wait for the loop to finish the read, worst case.
+const POLL_MAX_WAIT: Duration = Duration::from_secs(20);
 
 pub fn now_epoch() -> u64 {
     std::time::SystemTime::now()
@@ -534,88 +540,12 @@ async fn status_server(port: u16, shared: Arc<Shared>) {
     log::info!("status: http://0.0.0.0:{port}/");
     loop {
         match listener.accept().await {
-            Ok((mut s, _)) => {
-                // Read the request head (until the blank line); we never need the body.
-                let mut buf = Vec::new();
-                let mut tmp = [0u8; 512];
-                let d = tokio::time::Instant::now() + Duration::from_secs(3);
-                while tokio::time::Instant::now() < d && !buf.windows(4).any(|w| w == b"\r\n\r\n") && buf.len() < 8192 {
-                    if let Ok(n) = tokio::time::timeout(Duration::from_millis(500), s.read(&mut tmp)).await {
-                        let n = n.unwrap_or(0);
-                        if n == 0 { break; }
-                        buf.extend_from_slice(&tmp[..n]);
-                    }
-                }
-                let req = String::from_utf8_lossy(&buf);
-                let mut lines = req.lines();
-                let mut parts = lines.next().unwrap_or("").split_whitespace();
-                let method = parts.next().unwrap_or("GET").to_string();
-                let path = parts.next().unwrap_or("/").to_string();
-                let (m, q) = match path.split_once('?') {
-                    Some((a, b)) => (a, b),
-                    None => (path.as_str(), ""),
-                };
-                let resp = match (method.as_str(), m) {
-                    ("GET", "/") => http_response("200 OK", "text/html; charset=utf-8", PAGE_HTML),
-                    ("GET", "/state.json") => {
-                        let (st, f) = {
-                            let st = shared.status.lock().await;
-                            let f = *shared.force.lock().await;
-                            (st.clone(), f)
-                        };
-                        http_response("200 OK", "application/json", &status_to_json(&st, &f))
-                    }
-                    ("POST", "/dry") => {
-                        // mins = query param, 1..1440 clamped
-                        let mins: u64 = q.split('&').find_map(|kv| {
-                            let (k, v) = kv.split_once('=')?;
-                            (k == "mins").then(|| v.parse::<u64>().ok()).flatten()
-                        }).unwrap_or(0).clamp(1, 1440);
-                        let deadline = std::time::Instant::now() + Duration::from_secs(mins * 60);
-                        {
-                            let mut f = shared.force.lock().await;
-                            *f = Some(deadline);
-                        }
-                        write_force_file(Some(now_epoch() + mins * 60));
-                        shared.notify.notify_one(); // wake the loop NOW (short timers)
-                        log::info!("dry: ON for {mins}m");
-                        http_response("200 OK", "application/json", &format!(r#"{{"ok":true,"mins":{mins}}}"#))
-                    }
-                    ("POST", "/dry-off") => {
-                        {
-                            let mut f = shared.force.lock().await;
-                            *f = None;
-                        }
-                        write_force_file(None);
-                        shared.notify.notify_one(); // re-evaluate band immediately
-                        log::info!("dry: OFF");
-                        http_response("200 OK", "application/json", r#"{"ok":true}"#)
-                    }
-                    ("POST", "/poll") => {
-                        // Manual live read; rate-limited so the radio can breathe.
-                        let (allowed, wait) = {
-                            let mut lp = shared.last_poll.lock().await;
-                            match *lp {
-                                Some(t) if t.elapsed() < POLL_MIN_INTERVAL => {
-                                    let rem = POLL_MIN_INTERVAL.saturating_sub(t.elapsed());
-                                    (false, rem.as_secs())
-                                }
-                                _ => { *lp = Some(std::time::Instant::now()); (true, 0u64) }
-                            }
-                        };
-                        if allowed {
-                            shared.notify.notify_one(); // wake loop for an immediate read
-                            log::info!("poll: manual read requested");
-                            http_response("200 OK", "application/json", r#"{"ok":true}"#)
-                        } else {
-                            http_response("429 Too Many Requests", "application/json",
-                                &format!(r#"{{"ok":false,"error":"rate limited","retry_after":{wait}}}"#))
-                        }
-                    }
-                    _ => http_response("404 Not Found", "application/json", r#"{"ok":false,"error":"not found"}"#),
-                };
-                let _ = s.write_all(resp.as_bytes()).await;
-                drop(s);
+            Ok((s, _)) => {
+                // Handle each connection concurrently, so a slow POST /poll
+                // (which waits up to 20s for a sensor read) never blocks the
+                // 30s auto-refresh or other tabs.
+                let shared = shared.clone();
+                tokio::spawn(async move { handle_conn(s, &shared).await; });
             }
             Err(e) => {
                 log::error!("status accept: {e}");
@@ -623,6 +553,103 @@ async fn status_server(port: u16, shared: Arc<Shared>) {
             }
         }
     }
+}
+
+async fn handle_conn(mut s: tokio::net::TcpStream, shared: &Arc<Shared>) {
+    // Read the request head (until the blank line); we never need the body.
+    let mut buf = Vec::new();
+    let mut tmp = [0u8; 512];
+    let d = tokio::time::Instant::now() + Duration::from_secs(3);
+    while tokio::time::Instant::now() < d && !buf.windows(4).any(|w| w == b"\r\n\r\n") && buf.len() < 8192 {
+        if let Ok(n) = tokio::time::timeout(Duration::from_millis(500), s.read(&mut tmp)).await {
+            let n = n.unwrap_or(0);
+            if n == 0 { break; }
+            buf.extend_from_slice(&tmp[..n]);
+        }
+    }
+    let req = String::from_utf8_lossy(&buf);
+    let mut lines = req.lines();
+    let mut parts = lines.next().unwrap_or("").split_whitespace();
+    let method = parts.next().unwrap_or("GET").to_string();
+    let path = parts.next().unwrap_or("/").to_string();
+    let (m, q) = match path.split_once('?') {
+        Some((a, b)) => (a, b),
+        None => (path.as_str(), ""),
+    };
+    let resp = match (method.as_str(), m) {
+        ("GET", "/") => http_response("200 OK", "text/html; charset=utf-8", PAGE_HTML),
+        ("GET", "/state.json") => {
+            let (st, f) = {
+                let st = shared.status.lock().await;
+                let f = *shared.force.lock().await;
+                (st.clone(), f)
+            };
+            http_response("200 OK", "application/json", &status_to_json(&st, &f))
+        }
+        ("POST", "/dry") => {
+            // mins = query param, 1..1440 clamped
+            let mins: u64 = q.split('&').find_map(|kv| {
+                let (k, v) = kv.split_once('=')?;
+                (k == "mins").then(|| v.parse::<u64>().ok()).flatten()
+            }).unwrap_or(0).clamp(1, 1440);
+            let deadline = std::time::Instant::now() + Duration::from_secs(mins * 60);
+            {
+                let mut f = shared.force.lock().await;
+                *f = Some(deadline);
+            }
+            write_force_file(Some(now_epoch() + mins * 60));
+            shared.notify.notify_one(); // wake the loop NOW (short timers)
+            log::info!("dry: ON for {mins}m");
+            http_response("200 OK", "application/json", &format!(r#"{{"ok":true,"mins":{mins}}}"#))
+        }
+        ("POST", "/dry-off") => {
+            {
+                let mut f = shared.force.lock().await;
+                *f = None;
+            }
+            write_force_file(None);
+            shared.notify.notify_one(); // re-evaluate band immediately
+            log::info!("dry: OFF");
+            http_response("200 OK", "application/json", r#"{"ok":true}"#)
+        }
+        ("POST", "/poll") => {
+            // Manual live read; rate-limited so the radio can breathe. This
+            // handler BLOCKS until the loop has finished the sensor attempt
+            // (gen bump) so the page reads FRESH state, never mid-scan.
+            let (allowed, wait) = {
+                let mut lp = shared.last_poll.lock().await;
+                match *lp {
+                    Some(t) if t.elapsed() < POLL_MIN_INTERVAL => {
+                        let rem = POLL_MIN_INTERVAL.saturating_sub(t.elapsed());
+                        (false, rem.as_secs())
+                    }
+                    _ => { *lp = Some(std::time::Instant::now()); (true, 0u64) }
+                }
+            };
+            if allowed {
+                let gen0 = *shared.gen.borrow();
+                shared.notify.notify_one(); // wake loop for an immediate read
+                let mut rx = shared.gen.subscribe();
+                let deadline = tokio::time::Instant::now() + POLL_MAX_WAIT;
+                while *rx.borrow() == gen0 && tokio::time::Instant::now() < deadline {
+                    let _ = tokio::time::timeout(Duration::from_millis(250), rx.changed()).await;
+                }
+                log::info!("poll: manual read requested");
+                let (st, f) = {
+                    let st = shared.status.lock().await;
+                    let f = *shared.force.lock().await;
+                    (st.clone(), f)
+                };
+                http_response("200 OK", "application/json", &status_to_json(&st, &f))
+            } else {
+                http_response("429 Too Many Requests", "application/json",
+                    &format!(r#"{{"ok":false,"error":"rate limited","retry_after":{wait}}}"#))
+            }
+        }
+        _ => http_response("404 Not Found", "application/json", r#"{"ok":false,"error":"not found"}"#),
+    };
+    let _ = s.write_all(resp.as_bytes()).await;
+    drop(s);
 }
 
 // ===================== DASHBOARD PAGE (lila.lan style) =====================
@@ -754,14 +781,15 @@ function fmtDur(s){
   return m+'m '+sec+'s';
 }
 function refresh(){
-  // Manual: request a LIVE sensor read (rate-limited server-side), then show
-  // the fresh state. Auto-refresh stays cheap cache-only — see refreshTimer.
+  // Manual: request a LIVE sensor read (rate-limited server-side). The
+  // response IS the fresh state (the server waits for the read to finish),
+  // so render it directly — no second fetch, no race with a mid-scan read.
   const btn = document.getElementById('refreshBtn');
   btn.disabled = true;
   btn.textContent = 'Reading…';
   fetch('/poll',{method:'POST'}).then(r=>r.json()).then(function(d){
-    if(!d.ok && d.retry_after){ btn.textContent = 'Wait '+d.retry_after+'s'; return; }
-    fetchState();
+    if(d.retry_after){ btn.textContent = 'Wait '+d.retry_after+'s'; return; }
+    if(d.temp!==undefined){ render(d); }
   }).catch(function(){ fetchState(); }).finally(function(){
     setTimeout(function(){ btn.textContent = 'Refresh now'; btn.disabled = false; }, 1500);
   });
@@ -923,6 +951,7 @@ async fn daemon_loop(c: &btleplug::platform::Adapter, interval_s: u64, hi: u8, l
         status: tokio::sync::Mutex::new(Status::new(hi, lo, interval_s)),
         force: tokio::sync::Mutex::new(init_force_from_file()),
         last_poll: tokio::sync::Mutex::new(None),
+        gen: tokio::sync::watch::channel(0u64).0,
         notify: tokio::sync::Notify::new(),
     });
     if status_port != 0 {
@@ -976,6 +1005,8 @@ async fn daemon_loop(c: &btleplug::platform::Adapter, interval_s: u64, hi: u8, l
                 st.last_error = Some(e);
             }
         }
+        // Signal POST /poll (and anyone watching) that a sensor attempt is done.
+        let _ = shared.gen.send(*shared.gen.borrow() + 1);
         // Sleep until the next poll — or until the dry timer ends, whichever is
         // sooner — and wake immediately when dry state changes (server notifies).
         let sleep_dur = {
