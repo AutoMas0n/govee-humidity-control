@@ -121,6 +121,23 @@ the common 8080 web port.
    whole daemon lifetime (`fix-daemon-ble-session-leak`): `daemon_loop`
    creates one session, reuses it for sensor reads and plug toggles; CLI
    one-shots keep their own (process exit closes them).
+
+4b. **Plug-BLE operation timeouts (2026-09-25)** — `per.connect()` and the
+   other plug handshake steps had no timeout; with the basement plug ~10 m
+   away on a flaky link, `plug_off` could hang the loop forever (observed
+   live: loop froze after "need OFF", the whole status server went silent).
+   All plug ops are now wrapped in `tokio::time::timeout` (connect 12 s,
+   discover/subscribe/handshake 8 s, init 10 s); a failed link retries 3×
+   and the loop keeps cycling.
+
+4c. **Refresh-now UX (2026-09-25)** — the manual "Refresh now" button now
+   does a live read: `POST /poll` (rate-limited 1/30 s) wakes the loop via
+   an in-process `Notify`, and the page retries `/state.json` until the
+   sensor attempt completes, so one tap shows fresh data. Connections are
+   handled concurrently (one `tokio::spawn` per socket) so a slow poll
+   never blocks auto-refresh. Earlier attempt to have the server wait on a
+   `watch` generation counter caused a hang under load — removed in favor
+   of the client-side retry.
 5. Pi: rebuilt release binary, `systemctl stop/disable myscript.service`
    (the old cloud `main.py`), `cp` unit to `/etc/systemd/system/`,
    `systemctl enable --now humidity-daemon`. Verified:
@@ -337,6 +354,8 @@ curl -X POST http://192.168.2.21:8843/dry-off       # cancel dry mode
 #   first read. Missed polls keep the last good reading on the page with a
 #   "missed" banner (no more blank error page). RSSI meter: green ≥-70, amber
 #   -70..-85, red <-85 dBm.
+#   /poll wakes the loop for an instant read; the page retries /state.json until
+#   the attempt finishes, so "Refresh now" always shows fresh data.
 
 # run it as a service (unit targets dehumidifier E1DD, 900 s / 45% / port 8843):
 sudo cp govee-ble/humidity-daemon.service /etc/systemd/system/
