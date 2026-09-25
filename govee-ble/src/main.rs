@@ -749,9 +749,10 @@ function render(st){
   meter.querySelector('div').style.width = (r==null? 10 : Math.min(100, Math.max(5, (r+100)/55*100))) + '%';
   document.getElementById('rssiLabel').textContent = r==null ? 'unknown' : (r>=-70 ? 'strong' : (r>=-85 ? 'marginal' : 'weak'));
   document.getElementById('dbm').textContent = r==null ? '—' : r+' dBm';
-  // miss
+  // miss — ONLY when the failed attempt is the most recent one (if a success
+  // landed afterwards, last_attempt_ts == last_ok_ts and there's no miss).
   const miss = document.getElementById('miss');
-  if(st.last_error && st.last_ok_ts>0){
+  if(st.last_error && st.last_ok_ts>0 && st.last_attempt_ts !== st.last_ok_ts){
     miss.classList.add('show');
     document.getElementById('missAge').textContent = ago(st.last_attempt_ts);
   } else miss.classList.remove('show');
@@ -819,7 +820,8 @@ function dryOff(){
     if(d.ok) setTimeout(refresh, 300);
   });
 }
-refresh();
+fetchState();          // show cached data instantly on load (no blank page)
+refresh();             // then request a live read in the background
 setInterval(fetchState, 30000); // auto-refresh: cache only, no live scans
 setInterval(function(){ // 1s countdown ticker for dry mode
   if(lastState && lastState.force_until!=null && lastState.force_until>Date.now()/1000){
