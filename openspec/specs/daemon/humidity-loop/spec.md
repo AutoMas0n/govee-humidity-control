@@ -102,6 +102,12 @@ The SHALL handle BLE scan/connection failures gracefully and continue the loop, 
 - **WHEN** the daemon cannot connect to the H5080 plug
 - **THEN** it logs the error and retries on the next poll cycle (no cascade failure)
 
+#### Scenario: BLE session count stays bounded over the daemon lifetime
+- **WHEN** the daemon has run for an extended period (hours to days) across many
+  poll cycles
+- **THEN** the number of open BLE/D-Bus session file descriptors does not grow
+  with each cycle — a single adapter is reused for the process lifetime
+
 ### Requirement: Dry clothes force mode
 The daemon SHALL support a timer-based force mode that keeps the H5080 plug ON for a configured duration regardless of humidity. The bandwidth is suspended while the timer is active; on expiry the loop resumes the hysteresis band.
 
