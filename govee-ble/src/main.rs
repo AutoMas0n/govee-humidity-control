@@ -210,12 +210,22 @@ async fn try_plug_inner<T, Fut>(c: &btleplug::platform::Adapter, plug_mac: &str,
 where Fut: Future<Output = Result<T, String>>,
 {
     let per = find_mac(c, plug_mac, 10).await?;
-    per.connect().await.map_err(|e| format!("conn: {e}"))?;
+    // The plug sits ~10 m away on a flaky BLE link; an untimed connect can
+    // hang the loop forever on D-Bus (observed live: loop froze after "need
+    // OFF"). Always bound the connect; on timeout the caller retries.
+    tokio::time::timeout(Duration::from_secs(12), per.connect())
+        .await.map_err(|_| "conn: timeout")?
+        .map_err(|e| format!("conn: {e}"))?;
     sleep(Duration::from_millis(500)).await;
-    per.discover_services().await.map_err(|e| format!("disc svc: {e}"))?;
-    sub_notify(&per).await?;
-    let sk = handshake(&per).await?;
-    init_plug(&per, &sk, skey).await?;
+    tokio::time::timeout(Duration::from_secs(8), per.discover_services())
+        .await.map_err(|_| "disc svc: timeout")?
+        .map_err(|e| format!("disc svc: {e}"))?;
+    tokio::time::timeout(Duration::from_secs(8), sub_notify(&per))
+        .await.map_err(|_| "sub: timeout")??;
+    let sk = tokio::time::timeout(Duration::from_secs(8), handshake(&per))
+        .await.map_err(|_| "handshake: timeout")??;
+    tokio::time::timeout(Duration::from_secs(10), init_plug(&per, &sk, skey))
+        .await.map_err(|_| "init: timeout")??;
     let r = action(per, sk).await;
     r
 }
@@ -440,10 +450,6 @@ struct Shared {
     status: tokio::sync::Mutex<Status>,
     force: tokio::sync::Mutex<Option<std::time::Instant>>,
     last_poll: tokio::sync::Mutex<Option<std::time::Instant>>,
-    // Poll completion signal: the loop bumps generations after every sensor
-    // attempt (success or error); POST /poll waits for a bump so the page never
-    // reads state mid-scan (the "blank on first tap" race).
-    gen: tokio::sync::watch::Sender<u64>,
     notify: tokio::sync::Notify,
 }
 
@@ -451,8 +457,6 @@ struct Shared {
 // runs a ~10s BLE scan, so tighter would hammer the radio). Rate limit does
 // NOT apply to the daemon's own cycle or to dry-mode wakeups.
 const POLL_MIN_INTERVAL: Duration = Duration::from_secs(30);
-// How long POST /poll will wait for the loop to finish the read, worst case.
-const POLL_MAX_WAIT: Duration = Duration::from_secs(20);
 
 pub fn now_epoch() -> u64 {
     std::time::SystemTime::now()
@@ -613,9 +617,6 @@ async fn handle_conn(mut s: tokio::net::TcpStream, shared: &Arc<Shared>) {
             http_response("200 OK", "application/json", r#"{"ok":true}"#)
         }
         ("POST", "/poll") => {
-            // Manual live read; rate-limited so the radio can breathe. This
-            // handler BLOCKS until the loop has finished the sensor attempt
-            // (gen bump) so the page reads FRESH state, never mid-scan.
             let (allowed, wait) = {
                 let mut lp = shared.last_poll.lock().await;
                 match *lp {
@@ -627,20 +628,9 @@ async fn handle_conn(mut s: tokio::net::TcpStream, shared: &Arc<Shared>) {
                 }
             };
             if allowed {
-                let gen0 = *shared.gen.borrow();
-                shared.notify.notify_one(); // wake loop for an immediate read
-                let mut rx = shared.gen.subscribe();
-                let deadline = tokio::time::Instant::now() + POLL_MAX_WAIT;
-                while *rx.borrow() == gen0 && tokio::time::Instant::now() < deadline {
-                    let _ = tokio::time::timeout(Duration::from_millis(250), rx.changed()).await;
-                }
+                shared.notify.notify_one(); // loop wakes and reads NOW
                 log::info!("poll: manual read requested");
-                let (st, f) = {
-                    let st = shared.status.lock().await;
-                    let f = *shared.force.lock().await;
-                    (st.clone(), f)
-                };
-                http_response("200 OK", "application/json", &status_to_json(&st, &f))
+                http_response("200 OK", "application/json", r#"{"ok":true}"#)
             } else {
                 http_response("429 Too Many Requests", "application/json",
                     &format!(r#"{{"ok":false,"error":"rate limited","retry_after":{wait}}}"#))
@@ -781,15 +771,26 @@ function fmtDur(s){
   return m+'m '+sec+'s';
 }
 function refresh(){
-  // Manual: request a LIVE sensor read (rate-limited server-side). The
-  // response IS the fresh state (the server waits for the read to finish),
-  // so render it directly — no second fetch, no race with a mid-scan read.
+  // Manual live read: POST /poll (rate-limited server-side) wakes the daemon;
+  // the page then retries /state.json until the sensor attempt completes
+  // (last_attempt_ts advances past where it was) so we show FRESH data.
   const btn = document.getElementById('refreshBtn');
   btn.disabled = true;
   btn.textContent = 'Reading…';
-  fetch('/poll',{method:'POST'}).then(r=>r.json()).then(function(d){
-    if(d.retry_after){ btn.textContent = 'Wait '+d.retry_after+'s'; return; }
-    if(d.temp!==undefined){ render(d); }
+  fetch('/state.json').then(r=>r.json()).then(function(st){
+    const prev = st.last_attempt_ts || 0;
+    return fetch('/poll',{method:'POST'}).then(r=>r.json()).then(function(d){
+      if(d.retry_after){ btn.textContent = 'Wait '+d.retry_after+'s'; return; }
+      // retry state until the loop's attempt finishes (≤ ~15s), then render
+      let tries = 0;
+      const poll = function(){
+        fetch('/state.json').then(r=>r.json()).then(function(n){
+          if(n.last_attempt_ts > prev || ++tries > 20){ render(n); }
+          else setTimeout(poll, 800);
+        }).catch(function(){ render(null); });
+      };
+      setTimeout(poll, 800);
+    });
   }).catch(function(){ fetchState(); }).finally(function(){
     setTimeout(function(){ btn.textContent = 'Refresh now'; btn.disabled = false; }, 1500);
   });
@@ -951,7 +952,6 @@ async fn daemon_loop(c: &btleplug::platform::Adapter, interval_s: u64, hi: u8, l
         status: tokio::sync::Mutex::new(Status::new(hi, lo, interval_s)),
         force: tokio::sync::Mutex::new(init_force_from_file()),
         last_poll: tokio::sync::Mutex::new(None),
-        gen: tokio::sync::watch::channel(0u64).0,
         notify: tokio::sync::Notify::new(),
     });
     if status_port != 0 {
@@ -1005,8 +1005,6 @@ async fn daemon_loop(c: &btleplug::platform::Adapter, interval_s: u64, hi: u8, l
                 st.last_error = Some(e);
             }
         }
-        // Signal POST /poll (and anyone watching) that a sensor attempt is done.
-        let _ = shared.gen.send(*shared.gen.borrow() + 1);
         // Sleep until the next poll — or until the dry timer ends, whichever is
         // sooner — and wake immediately when dry state changes (server notifies).
         let sleep_dur = {
