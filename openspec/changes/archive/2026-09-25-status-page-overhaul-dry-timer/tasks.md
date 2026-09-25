@@ -25,8 +25,8 @@
 
 ## 5. Deployment on the Pi
 
-- [ ] 5.1 Commit + push; on the Pi `git pull`, `cargo build --release`, restart `humidity-daemon`; verify `systemctl is-active` and that both `GET /` (HTML) and `GET /state.json` respond on port 8843
+- [x] 5.1 Commit + push; on the Pi `git pull`, `cargo build --release`, restart `humidity-daemon`; verify `systemctl is-active` and that both `GET /` (HTML) and `GET /state.json` respond on port 8843
 - [x] 5.2 Live test: run a force session (`POST /dry?mins=10`), confirm the status page shows dry mode + countdown, confirm `journalctl` shows plug ON held through a band-off condition, and confirm expiry returns control to the band (humidity below lo turns plug OFF)
 - [x] 5.2b Persistence live test: while a dry session is active, `sudo systemctl restart humidity-daemon`; confirm the countdown/force_until survives the restart (spec: "Force mode survives daemon restart"), and that a stale past deadline from the file is ignored on boot
 - [x] 5.3 Verify miss-retention live: sensor moved out of range ~22:36Z Sep 24 — state.json retained last good values with last_attempt_ts advanced + last_error set, page served 200 with banner JS; after restoring the sensor a live poll (`POST /poll`) recovered: fresh last_ok_ts, last_error null, banner clear, RSSI green — **both parts verified live 2026-09-24**
-- [ ] 5.4 Update HANDOVER.md status-page + dry-mode sections; commit + push; sync the Pi; confirm `git status` clean on both
+- [x] 5.4 Update HANDOVER.md status-page + dry-mode sections; commit + push; sync the Pi; confirm `git status` clean on both
